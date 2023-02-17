@@ -6,7 +6,7 @@ services:
     volumes:
       - simpledb:/var/lib/mysql
     environment:
-      MYSQL_ROOT_PASSWORD: TestDb&890
+      MYSQL_ROOT_PASSWORD: TestDb890
 
   app:
     build:
@@ -17,7 +17,7 @@ services:
     environment:
       MYSQL_HOST: db
       MYSQL_USER: root
-      MYSQL_ROOT_PASSWORD: TestDb&890
+      MYSQL_ROOT_PASSWORD: TestDb890
     depends_on:
       - db
 

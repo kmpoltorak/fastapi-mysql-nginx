@@ -265,9 +265,8 @@ async def insert_row(request: RowRequest):
         table_name = request.table_name
         columns = request.columns
         values = request.values
-        logging.info(f"INSERT INTO {table_name} ({*columns}) VALUES ({*values})")
-        sql = SqlOperation(f"INSERT INTO {table_name} ({*columns}) VALUES ({*values})", database_name)
-        sql.execute()
+        # sql = SqlOperation(f"INSERT INTO {table_name} ({*columns}) VALUES ({*values})", database_name)
+        # sql.execute()
 
         return {'code': 200, 'message': f'Table {table_name} has been deleted from database {database_name}'}
 

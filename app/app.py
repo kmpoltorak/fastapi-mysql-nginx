@@ -8,6 +8,7 @@ import auth
 from utils import SqlOperation
 from model import *
 
+__version__ = "1.2.0"
 
 # Request tags
 tags_metadata = [
@@ -19,19 +20,13 @@ tags_metadata = [
     },
     {
         "name": "Table",
-    },
-    {
-        "name": "Row",
-    },
-    {
-        "name": "User",
     }
 ]
 
 # Initiate FastAPI with vault API key authentication by "AccessToken" in request header
 app = FastAPI(
     title="MySQL API",
-    version="1.0.0",
+    version=__version__,
     dependencies=[Depends(auth.get_api_key)],
     contact={
         "name": "Krzysztof Poltorak",
@@ -69,7 +64,7 @@ async def api():
     Returns:
         dict: message with API version
     """
-    return {"message": "MySQL API version 1.0.0"}
+    return {"message": f"MySQL API version {__version__}"}
 
 ##################### Database routes section #####################
 
@@ -233,105 +228,3 @@ async def delete_table(request: TableRequest):
 
     except Exception as exc:
         return {'code': 500, 'message': str(exc)}
-
-##################### Row routes section #####################
-
-@app.get("/rows/get", tags=["Row"], name="")
-async def get_row(request: RowRequest):
-    """ Get row """
-    return request
-
-# @app.get("/row/get/", tags=["Row"], name="")
-# async def get_row(request: RowRequest):
-#     """ Get row """
-#     return request
-
-@app.post("/row/insert", tags=["Row"], name="")
-async def insert_row(request: RowRequest):
-    """Insert row into specified table
-
-    Args:
-        request (RowRequest):
-            database_name (str): database name
-            table_name (str): table name which exists in provided database
-            columns (list): list of columns in the table
-            values (list): list of values to add to row columns
-
-    Returns:
-        dict: Code and message about statement status
-    """
-    try:
-        database_name = request.database_name
-        table_name = request.table_name
-        columns = request.columns
-        values = request.values
-        # sql = SqlOperation(f"INSERT INTO {table_name} ({*columns}) VALUES ({*values})", database_name)
-        # sql.execute()
-
-        return {'code': 200, 'message': f'Table {table_name} has been deleted from database {database_name}'}
-
-    except Exception as exc:
-        return {'code': 500, 'message': str(exc)}
-
-
-@app.put("/row/update", tags=["Row"], name="")
-async def update_row(request: ConditionRowRequest):
-    """Update data in table row
-
-    Args:
-        request (ConditionRowRequest):
-            database_name (str): database name
-            table_name (str): table name which exists in provided database
-            columns (list): list of columns in the table
-            values (list): list of values to update in the row
-            column (str): existing column in table
-            value (str): existing value in table
-
-    Returns:
-        dict: Code and message about statement status
-    """
-    try:
-        database_name = request.database_name
-        table_name = request.table_name
-        columns = request.columns
-        values = request.values
-        column = request.column
-        value = request.value
-        # sql = SqlOperation(f"UPDATE {table_name} SET {} WHERE ({column}={value})", database_name)
-        # sql.execute()
-
-        return {'code': 200, 'message': f'Table {table_name} has been deleted from database {database_name}'}
-
-    except Exception as exc:
-        return {'code': 500, 'message': str(exc)}
-
-
-@app.delete("/row/delete", tags=["Row"], name="")
-async def delete_row(request: DeleteRowRequest):
-    """ Delete row """
-    return request
-
-##################### User routes section #####################
-
-@app.get("/user/get", tags=["User"], name="")
-async def get_user(request: UserRequest):
-    """ Get user """
-    return request
-
-
-@app.post("/user/create", tags=["User"], name="")
-async def create_user(request: UserRequest):
-    """ Create user """
-    return request
-
-
-@app.put("/user/update", tags=["User"], name="")
-async def update_user(request: UserRequest):
-    """ Update user """
-    return request
-
-
-@app.delete("/user/delete", tags=["User"], name="")
-async def delete_user(request: UserRequest):
-    """ Delete user """
-    return request

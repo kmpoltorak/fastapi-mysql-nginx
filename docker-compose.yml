@@ -1,4 +1,4 @@
-version: '1.1'
+version: '1.2'
 services:
   db:
     image: mysql:latest
@@ -16,6 +16,8 @@ services:
       MYSQL_HOST: db
       MYSQL_USER: root
       MYSQL_ROOT_PASSWORD: TestDb890
+      TZ: Europe/Warsaw
+      API_KEY: test
     depends_on:
       - db
 

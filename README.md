@@ -4,8 +4,8 @@ MySQL on backend with FastAPI on frontend accessed via Nginx created for dev and
 # Features
 1. Actions on databases
 2. Actions on tables
-3. Actions on rows - TO DO
-4. Actions on user - TO DO
+3. Actions on rows - To Do
+4. Actions on user - To Do
 
 # Prerequirements
 * Docker installed

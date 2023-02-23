@@ -13,17 +13,17 @@ MySQL on backend with FastAPI on frontend accessed via Nginx created for dev and
 
 # Environment variables
 In docker-compose.yml you can change environment variables like:
-`MYSQL_HOST`
-`MYSQL_USER`
-`MYSQL_ROOT_PASSWORD`
-`API_KEY`
-`TZ`
+> `MYSQL_HOST`
+> `MYSQL_USER`
+> `MYSQL_ROOT_PASSWORD`
+> `API_KEY`
+> `TZ`
 
 # Deploy
-`docker compose build && docker compose up -d`
+> `docker compose build && docker compose up -d`
 
 Recreate after changes:
-`docker compose build && docker compose up -d --force-recreate`
+> `docker compose build && docker compose up -d --force-recreate`
 
 To setup SSL certificate on Nginx:
 1. modify configuration in `nginx/fastapi.conf`

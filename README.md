@@ -29,7 +29,7 @@ To setup SSL certificate on Nginx:
 1. modify configuration in `nginx/fastapi.conf`
 2. add certificate and key to the `nginx/` directory
 3. add COPY statement to `nginx/Dockerfile`
-> `COPY certificate* /etc/ssl/`
+- `COPY certificate* /etc/ssl/`
 4. copy SSL certificate and key files to `/etc/ssl`
 5. change/add expose port of Nginx to 443 in docker-compose proxy section
 

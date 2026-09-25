@@ -1,5 +1,5 @@
-from typing import Any, Optional, List
-from pydantic import BaseModel, ConfigDict, field_validator
+from typing import Any, Literal, Optional, List
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import re
 
 
@@ -36,6 +36,41 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
 
     model_config = example(email="john@newmail.com", password="newpassword")
+
+
+# Auth models
+class TokenRequest(BaseModel):
+    client_id: str
+    client_secret: str
+
+    model_config = example(client_id="app", client_secret="secret-from-env")
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int  # seconds
+
+
+class ClientCreate(BaseModel):
+    client_id: str = Field(min_length=1, max_length=64)
+
+    model_config = example(client_id="nightly-backup")
+
+
+class UserLoginRequest(BaseModel):
+    username: str
+    password: str
+    totp: Optional[str] = None
+
+    model_config = example(username="johndoe", password="strongpassword", totp="123456")
+
+
+class TotpEnableRequest(BaseModel):
+    secret: str
+    code: str
+
+    model_config = example(secret="JBSWY3DPEHPK3PXP", code="123456")
 
 
 # Unified API response model
@@ -106,6 +141,29 @@ class TableCreateRequest(TableRequest):
     )
 
 
+class TableAlterRequest(TableRequest):
+    action: Literal["add", "modify", "drop", "rename"]
+    column_name: str
+    params: Optional[str] = None  # column definition, required for add/modify
+    new_column_name: Optional[str] = None  # required for rename
+
+    @field_validator('column_name', 'new_column_name')
+    @classmethod
+    def validate_column_names(cls, v):
+        return v if v is None else validate_identifier(v)
+
+    @model_validator(mode='after')
+    def check_required_fields(self):
+        if self.action in ("add", "modify") and not self.params:
+            raise ValueError(f"params is required for action '{self.action}'")
+        if self.action == "rename" and not self.new_column_name:
+            raise ValueError("new_column_name is required for action 'rename'")
+        return self
+
+    model_config = example(database_name="testdb", table_name="users", action="add",
+                           column_name="age", params="INT NOT NULL DEFAULT 0")
+
+
 class TableRenameRequest(DatabaseRequest):
     old_table_name: str
     new_table_name: str
@@ -138,14 +196,22 @@ class RowInsertRequest(RowValuesRequest):
                            values={"username": "john", "email": "john@example.com"})
 
 
-class RowUpdateRequest(RowValuesRequest):
+class RowKeyMixin(BaseModel):
     row_id: int
+    key_column: str = "id"
+
+    @field_validator('key_column')
+    @classmethod
+    def validate_key_column(cls, v):
+        return validate_identifier(v)
+
+
+class RowUpdateRequest(RowKeyMixin, RowValuesRequest):
 
     model_config = example(database_name="testdb", table_name="users", row_id=1,
                            values={"username": "johnny"})
 
 
-class RowDeleteRequest(TableRequest):
-    row_id: int
+class RowDeleteRequest(RowKeyMixin, TableRequest):
 
     model_config = example(database_name="testdb", table_name="users", row_id=1)

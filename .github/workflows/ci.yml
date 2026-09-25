@@ -19,6 +19,30 @@ jobs:
       run: pip install -r app/requirements.txt flake8 pytest httpx
     - name: Lint with flake8
       run: flake8 app
-    - name: Test
+    - name: Unit tests
       working-directory: app
-      run: python -m pytest -q
+      run: python -m pytest -q tests/test_app.py
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Generate secrets
+      run: |
+        for v in MYSQL_ROOT_PASSWORD DB_PASSWORD AUTH_DB_PASSWORD JWT_SECRET API_CLIENT_SECRET; do
+          echo "$v=$(openssl rand -hex 32)"
+        done > .env
+    - name: Start stack (nginx + app + MySQL)
+      run: docker compose up -d --build --wait
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Integration tests
+      run: |
+        pip install pytest pyotp
+        set -a; . ./.env; set +a
+        cd app && INTEGRATION_URL=https://localhost python -m pytest -q tests/test_integration.py
+    - name: Logs on failure
+      if: failure()
+      run: docker compose logs

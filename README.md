@@ -2,63 +2,78 @@
 
 This project is a simple microservice stack for development and learning purposes. It provides a REST API (FastAPI) for MySQL database management, served behind Nginx. All services are containerized with Docker Compose.
 
+The API is a middle layer between an application and the database:
+
+```
+User ──(password + TOTP)──▶ Application ──(client JWT)──▶ Nginx (HTTPS) ──▶ API ──▶ MySQL
+                                 │                                           │
+                                 └──────── POST /user/login ─────────────────┘
+                                          (API verifies password + TOTP)
+```
+
+- **API clients** (the application, scripts) authenticate to the API with `client_id` + `client_secret` → JWT.
+- **Application users** are stored and verified by the API (`/user`, `/user/login` with optional TOTP); the application keeps its own user session.
+
 ## Features
 
 - Database management: create, list, delete, backup, restore
-- Table management: create, list, delete, rename, describe columns
-- Row management: insert, get, update, delete
-- User management: create, get, update, delete (in-memory demo)
-- API authentication via token (header: `AccessToken`)
-- Linting (flake8) and tests (pytest), run in GitHub Actions CI
+- Table management: create, list, delete, rename, alter columns (add/modify/drop/rename), describe columns
+- Row management: insert, get (paginated), update, delete (by `id` or any `key_column`)
+- API clients: OAuth2 client credentials → 15 min JWT, create/list/delete clients
+- Application users: create, list, get, update, delete (scrypt password hashes), login verification with optional TOTP 2FA, account lockout after failed attempts
+- HTTPS in Nginx (self-signed by default), HTTP -> HTTPS redirect, token endpoint rate limit
+- Least-privilege MySQL users instead of `root`
+- Linting (flake8), unit and integration tests (pytest), run in GitHub Actions CI
 
 ## Requirements
 
 - Docker
 - Docker Compose
 
-## Environment Variables
+## Configuration
 
-Copy `.env.example` to `.env` and adjust values (Docker Compose reads it automatically; defaults are used when unset):
+Copy `.env.example` to `.env` and set every value; the stack refuses to start with missing secrets. Use alphanumeric values, e.g. `openssl rand -hex 32`.
 
-- `MYSQL_HOST` - MySQL host (default: db)
-- `MYSQL_USER` - MySQL user (default: root)
-- `MYSQL_ROOT_PASSWORD` - MySQL root password
-- `API_KEY` - API authentication token
-- `TZ` - Timezone
+| Variable | Purpose |
+|---|---|
+| `MYSQL_ROOT_PASSWORD` | MySQL root (used only by the `db` container) |
+| `DB_PASSWORD` | MySQL user `api` – data operations |
+| `AUTH_DB_PASSWORD` | MySQL user `api_auth` – API clients and application users tables only |
+| `JWT_SECRET` | Token signing key (at least 32 characters) |
+| `API_CLIENT_ID`, `API_CLIENT_SECRET` | First API client (default id `app`), created when the clients table is empty |
+| `TZ` | Timezone |
+
+## Security Model
+
+- **MySQL users** (created by [db/init/01-users.sh](db/init/01-users.sh) on first start with an empty volume):
+  - `api` – may create/modify any database, but has no access to `mysql`, `sys` and `api_auth` (MySQL `partial_revokes`), cannot create users or grant privileges.
+  - `api_auth` – only `SELECT/INSERT/UPDATE/DELETE` on `api_auth` tables (`clients`, `users`), no DDL.
+  - So even arbitrary SQL sent to `/database/restore` cannot read password hashes or create a client.
+- **Passwords and client secrets** – hashed with scrypt + random salt (one-way, not encrypted), never returned by the API. Client secrets are shown only once, on creation.
+- **Access tokens** – JWT (HS256) valid for 15 minutes, not checked against the DB (fast); a deleted client keeps access until it expires. Clients simply request a new token.
+- **TOTP** – each code works only once (the last used 30 s time step is stored).
+- **Account lockout** – 5 wrong passwords/TOTP codes lock the user for 15 minutes (HTTP 423); a password change unlocks. Not done by IP in Nginx, because all users come through the application's IP.
+- **Nginx** – TLS 1.2/1.3, port 80 redirects to 443, `/auth/token` limited to 5 requests/min per IP (burst 20, then HTTP 429).
+
+After changing `db/init/` or on an existing volume from a previous version, recreate the database (**deletes all data**):
+
+```
+docker compose down -v && docker compose up -d --build
+```
 
 ## Deployment
 
 Build and start all services:
 
 ```
-docker compose build && docker compose up -d
+docker compose up -d --build
 ```
 
-Rebuild after changes:
+Open https://localhost/ (accept the self-signed certificate warning).
 
-```
-docker compose build && docker compose up -d --force-recreate
-```
+## HTTPS Certificate
 
-## Nginx SSL Setup (optional)
-
-1. Edit `nginx/fastapi.conf` for SSL configuration
-2. Add your certificate and key to the `nginx/` directory
-3. Add to `nginx/Dockerfile`:
-   ```
-   COPY certificate* /etc/ssl/
-   ```
-4. Expose port 443 in the `proxy` service in `docker-compose.yml`
-5. (Optional) Add HTTP->HTTPS redirect in `nginx/fastapi.conf`:
-   ```
-   server {
-       listen 80;
-       server_name _;
-       return 301 https://$host$request_uri;
-   }
-   ```
-
-**Note:** Remove passphrase from your certificate key if present (see OpenSSL docs).
+On first start Nginx generates a self-signed certificate into `nginx/certs/` (git-ignored). To use your own, put `cert.pem` and `key.pem` (without passphrase) there and restart the `proxy` service.
 
 ## Example: Running Containers
 
@@ -68,12 +83,70 @@ $ docker ps
 CONTAINER ID   IMAGE                       COMMAND                  ...
 ...           fastapi-mysql-nginx_proxy   ...
 ...           fastapi-mysql-nginx_app     ...
-...           mysql:8.3                   ...
+...           mysql:8.4                   ...
 ```
 
 ## API Usage
 
-You can use the FastAPI Swagger UI (available at `/`) or tools like curl/Postman. All endpoints except `/health` require the `AccessToken` header with the value set to your `API_KEY`.
+You can use the FastAPI Swagger UI (available at `/`) or tools like curl/Postman. All endpoints except `/health`, `/ready`, `/api` and `/auth/token` require a client Bearer token.
+
+### Health and readiness
+
+| Endpoint | Checks | Use |
+|---|---|---|
+| `GET /health` | process responds (no DB) | container healthcheck; always `200` while the app runs |
+| `GET /ready` | `SELECT 1` on both MySQL connections | monitoring / load balancer; `200` or `503` with `{"checks": {"database": "ok", "auth_database": "unavailable"}}` |
+
+`/health` deliberately ignores MySQL: during a database outage restarting the app wouldn't help. Both are public and don't reveal error details (they are logged).
+
+### API client token
+
+```
+curl -k -X POST https://localhost/auth/token -H 'Content-Type: application/json' \
+  -d '{"client_id": "app", "client_secret": "<API_CLIENT_SECRET>"}'
+# {"access_token": "eyJ...", "token_type": "bearer", "expires_in": 900}
+
+curl -k https://localhost/database/get -H 'Authorization: Bearer eyJ...'
+```
+
+In Swagger: call `/auth/token`, click **Authorize** and paste the `access_token`. When it expires, request a new one.
+
+More clients (e.g. one per application or script, so each can be revoked separately):
+
+```
+POST   /auth/clients  {"client_id": "nightly-backup"}   # returns client_secret – shown only once
+GET    /auth/clients
+DELETE /auth/clients/nightly-backup
+```
+
+### Application users
+
+```
+POST /user        {"username": "john", "email": "john@example.com", "password": "..."}
+POST /user/login  {"username": "john", "password": "...", "totp": "123456"}
+```
+
+`/user/login` returns the user (`id`, `username`, `email`, `totp_enabled`, `locked`) on success; the application then starts its own session. Responses:
+
+| Status | Meaning | What the application does |
+|---|---|---|
+| `200` | password (and TOTP) correct | log the user in |
+| `401` `TOTP code required` | password correct, TOTP enabled, `totp` missing | ask for the code, send again with `totp` |
+| `401` `Bad credentials` | wrong username, password or TOTP code | show an error |
+| `423` | account locked after 5 failed attempts | ask to wait 15 minutes (or reset password) |
+
+### TOTP (two-factor authentication for users)
+
+The user scans a QR code with an authenticator app (Google Authenticator, Aegis, 1Password...). The app and the API share a secret and both compute the same 6-digit code from it and the current time (every 30 s), so no connection between them is needed.
+
+1. `POST /user/{id}/totp/setup` – returns `secret` and an `otpauth://` `uri`; the application shows the `uri` as a QR code (for testing: `qrencode -t ansiutf8 '<uri>'`). Nothing is saved yet.
+2. `POST /user/{id}/totp/enable` with `{"secret": "...", "code": "123456"}` – proves the authenticator works and turns TOTP on.
+3. From now on `/user/login` requires `totp`. Each code can be used only once.
+4. `DELETE /user/{id}/totp` – turns it off (e.g. lost phone); the application decides who may do it.
+
+### Errors
+
+Errors use HTTP status codes with `{"detail": "..."}`: `400` statement rejected by MySQL (bad SQL, missing table, duplicate...), `401` missing/invalid token or bad credentials, `404` user/client not found, `423` user locked, `422` invalid input (e.g. identifier with forbidden characters), `429` too many token requests, `500` server/connection error.
 
 ### Example: Create Table
 
@@ -103,6 +176,25 @@ mysql> show columns from person;
 +---------+--------------+------+-----+---------+----------------+
 ```
 
+### Alter Table
+
+```
+PUT /table/alter
+{ "database_name": "test", "table_name": "person", "action": "add", "column_name": "age", "params": "INT DEFAULT 0" }
+```
+
+`action`: `add` / `modify` (need `params`), `drop`, `rename` (needs `new_column_name`).
+
+### Rows
+
+```
+GET /row/get/test/person?limit=100&offset=0          # limit 1–1000, default 100
+
+PUT /row/update
+{ "database_name": "test", "table_name": "person", "row_id": 1, "values": {"name": "Ann"} }
+# optional "key_column": "person_id" (default "id"), same for DELETE /row/delete
+```
+
 ### Database Backup & Restore
 
 **Backup:**
@@ -127,10 +219,18 @@ POST /database/restore
 
 ## Linting & Tests
 
-Tests mock the database, so no MySQL is needed:
+Unit tests mock the database:
 
 ```
 pip install -r app/requirements.txt flake8 pytest httpx
 flake8 app
-cd app && python -m pytest
+cd app && python -m pytest tests/test_app.py
+```
+
+Integration tests run against the whole running stack over HTTPS:
+
+```
+docker compose up -d --build --wait
+set -a; . ./.env; set +a
+cd app && INTEGRATION_URL=https://localhost python -m pytest tests/test_integration.py
 ```

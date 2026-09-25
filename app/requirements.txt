@@ -1,3 +1,5 @@
 fastapi
 mysql-connector-python
 hypercorn
+pyjwt
+pyotp

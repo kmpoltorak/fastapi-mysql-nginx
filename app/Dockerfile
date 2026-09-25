@@ -1,13 +1,15 @@
-FROM python:latest
+FROM python:3.11-slim
 
-COPY . /app
+RUN apt-get update && apt-get upgrade -yq \
+    && apt-get install -yq tzdata default-mysql-client \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-RUN apt-get update && apt-get upgrade -yq
-RUN apt-get install tzdata -yq
-RUN python -m pip install --upgrade pip
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
 
 EXPOSE 8080
 

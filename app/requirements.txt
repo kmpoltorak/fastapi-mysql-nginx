@@ -1,5 +1,3 @@
 fastapi
-starlette
 mysql-connector-python
 hypercorn
-requests

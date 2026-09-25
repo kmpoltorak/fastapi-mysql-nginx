@@ -19,7 +19,7 @@ def fake_query(statement, database_name=None, params=None, auth=False):
     return []
 
 
-app_module.query = auth.query = fake_query
+app_module.query = fake_query
 
 
 def test_health_is_public():
@@ -84,23 +84,12 @@ def test_totp():
     assert auth.totp_step(secret, None) is None
 
 
-def test_api_keys():
-    key = {"Authorization": "Bearer mk_unknown"}
-    assert client.get("/database/get", headers=key).status_code == 401  # not in DB
-    for method, path in (("GET", "/user"), ("POST", "/auth/api-keys"),
-                         ("POST", "/auth/totp/setup")):
-        assert client.request(method, path, headers=key, json={"name": "x"}).status_code == 403
+def test_user_login_and_clients_require_client_token():
+    for method, path in (("POST", "/user/login"), ("GET", "/user"), ("POST", "/auth/clients"),
+                         ("POST", "/user/1/totp/setup")):
+        assert client.request(method, path).status_code == 401
 
 
-def test_alter_table():
-    executed.clear()
-    base = {"database_name": "db", "table_name": "t", "column_name": "age"}
-    for body in ({"action": "add", "params": "INT"}, {"action": "modify", "params": "BIGINT"},
-                 {"action": "rename", "new_column_name": "years"}, {"action": "drop"}):
-        assert client.put("/table/alter", headers=HEADERS, json={**base, **body}).status_code == 200
-    assert [sql for sql, *_ in executed] == [
-        "ALTER TABLE t ADD COLUMN age INT", "ALTER TABLE t MODIFY COLUMN age BIGINT",
-        "ALTER TABLE t RENAME COLUMN age TO years", "ALTER TABLE t DROP COLUMN age"]
-    for bad in ({"action": "add"}, {"action": "rename"}, {"action": "truncate"},
-                {"action": "rename", "new_column_name": "x;--"}):
-        assert client.put("/table/alter", headers=HEADERS, json={**base, **bad}).status_code == 422
+def test_unknown_client_rejected():
+    assert client.post("/auth/token", json={"client_id": "x", "client_secret": "y"}
+                       ).status_code == 401

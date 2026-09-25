@@ -11,17 +11,16 @@ import pyotp
 from fastapi import HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from utils import query
-
-ACCESS_MINUTES = 15  # short: access tokens are not checked against the DB
-REFRESH_HOURS = 8    # one working day, then log in again (with TOTP)
-API_KEY_PREFIX = "mk_"
+ACCESS_MINUTES = 15  # clients just request a new token when it expires
+MAX_FAILED_LOGINS = 5
+LOCK_MINUTES = 15
 SCRYPT = {"n": 2**14, "r": 8, "p": 1}
 
-# ------------------- PASSWORDS -------------------
+# ------------------- PASSWORDS AND CLIENT SECRETS -------------------
 
 
 def hash_password(password: str) -> str:
+    """One-way scrypt hash with random salt; the password can't be recovered from it."""
     salt = os.urandom(16)
     digest = hashlib.scrypt(password.encode(), salt=salt, **SCRYPT)
     return f"scrypt${salt.hex()}${digest.hex()}"
@@ -33,21 +32,14 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(candidate.hex(), digest)
 
 
-# Checked when the user doesn't exist, so response time doesn't reveal valid usernames
+# Checked when the user/client doesn't exist, so response time doesn't reveal valid names
 DUMMY_HASH = hash_password("")
 
-# ------------------- RANDOM TOKENS (refresh tokens, API keys) -------------------
 
+def new_secret() -> str:
+    return secrets.token_urlsafe(32)
 
-def new_token(prefix: str = "") -> str:
-    return prefix + secrets.token_urlsafe(32)
-
-
-def token_hash(token: str) -> str:
-    """Fast unsalted hash is enough for 256-bit random tokens (unlike passwords)."""
-    return hashlib.sha256(token.encode()).hexdigest()
-
-# ------------------- TOTP -------------------
+# ------------------- TOTP (application users) -------------------
 
 
 def totp_step(secret: str, code: Optional[str], last_step: Optional[int] = None) -> Optional[int]:
@@ -66,45 +58,25 @@ def totp_step(secret: str, code: Optional[str], last_step: Optional[int] = None)
             return step
     return None
 
-# ------------------- BEARER: JWT ACCESS TOKEN OR API KEY -------------------
+# ------------------- JWT FOR API CLIENTS -------------------
 
 
-def create_access_token(username: str) -> str:
+def create_access_token(client_id: str) -> str:
     expires = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_MINUTES)
-    return jwt.encode({"sub": username, "exp": expires}, os.environ["JWT_SECRET"], "HS256")
+    return jwt.encode({"sub": client_id, "exp": expires}, os.environ["JWT_SECRET"], "HS256")
 
 
 bearer = HTTPBearer(auto_error=False)
-UNAUTHORIZED = HTTPException(status_code=401, detail="Not authenticated",
-                             headers={"WWW-Authenticate": "Bearer"})
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Security(bearer)) -> str:
-    """Username from a JWT access token (people) or an API key (scripts), else 401."""
+def get_current_client(credentials: HTTPAuthorizationCredentials = Security(bearer)) -> str:
+    """client_id from a valid Bearer JWT, else 401."""
+    # ponytail: JWT is stateless, a deleted client keeps access until it expires (ACCESS_MINUTES)
+    unauthorized = HTTPException(status_code=401, detail="Not authenticated",
+                                 headers={"WWW-Authenticate": "Bearer"})
     if credentials is None:
-        raise UNAUTHORIZED
-    token = credentials.credentials
-    if token.startswith(API_KEY_PREFIX):
-        rows = query("SELECT u.username FROM api_auth.api_keys k "
-                     "JOIN api_auth.users u ON u.id = k.user_id WHERE k.key_hash=%s",
-                     params=(token_hash(token),), auth=True)
-        if not rows:
-            raise UNAUTHORIZED
-        return rows[0]
-    # ponytail: JWT is stateless, a deleted user keeps access until it expires (ACCESS_MINUTES)
+        raise unauthorized
     try:
-        return jwt.decode(token, os.environ["JWT_SECRET"], ["HS256"])["sub"]
+        return jwt.decode(credentials.credentials, os.environ["JWT_SECRET"], ["HS256"])["sub"]
     except jwt.InvalidTokenError:
-        raise UNAUTHORIZED
-
-
-def get_session_user(credentials: HTTPAuthorizationCredentials = Security(bearer)) -> str:
-    """Like get_current_user, but API keys are refused.
-
-    Managing users, API keys and TOTP needs a real login, so a leaked key can't
-    create more keys, change passwords or lock the owner out with TOTP.
-    """
-    if credentials and credentials.credentials.startswith(API_KEY_PREFIX):
-        raise HTTPException(status_code=403,
-                            detail="API keys can't manage users, keys or TOTP, log in instead")
-    return get_current_user(credentials)
+        raise unauthorized

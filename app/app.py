@@ -25,21 +25,18 @@ from model import (
     RowDeleteRequest,
     DatabaseBackupRequest,
     DatabaseRestoreRequest,
-    ApiKeyCreate,
-    LoginRequest,
-    RefreshRequest,
+    ClientCreate,
+    TokenRequest,
     TokenResponse,
-    TotpCodeRequest,
     TotpEnableRequest,
+    UserLoginRequest,
     UserCreate,
     UserUpdate
 )
 
 Identifier = Annotated[str, Path(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
-CurrentUser = Annotated[str, Depends(auth.get_current_user)]
-SessionUser = Annotated[str, Depends(auth.get_session_user)]
-Protected = [Depends(auth.get_current_user)]
-SessionProtected = [Depends(auth.get_session_user)]
+CurrentClient = Annotated[str, Depends(auth.get_current_client)]
+Protected = [Depends(auth.get_current_client)]
 
 # Request tags
 tags_metadata = [
@@ -49,9 +46,8 @@ tags_metadata = [
     },
     {
         "name": "Auth",
-        "description": """People: log in with `/login` (+ TOTP if enabled), click
-        **Authorize** and paste the `access_token`; renew it with `/auth/refresh`.
-        Scripts: create an API key and use it the same way (Bearer)."""
+        "description": """API clients (applications, scripts) get a JWT from `/auth/token`
+        with `client_id` + `client_secret`, then click **Authorize** and paste it."""
     },
     {
         "name": "Database",
@@ -69,22 +65,23 @@ tags_metadata = [
     },
     {
         "name": "User",
-        "description": "Endpoints for API user management: create, update, delete, and fetch users."
+        "description": """Users of the application: CRUD, password + TOTP verification
+        with `/user/login` (the application keeps its own session), TOTP setup."""
     }
 ]
 
-__version__ = "2.1.0"
+__version__ = "2.0.0"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create the first admin user from env when the users table is empty."""
-    if not query("SELECT COUNT(*) FROM api_auth.users", auth=True)[0]:
-        query("INSERT INTO api_auth.users (username, email, password_hash) VALUES (%s, %s, %s)",
-              params=(os.getenv("ADMIN_USERNAME", "admin"), "",
-                      auth.hash_password(os.environ["ADMIN_PASSWORD"])),
+    """Create the first API client from env when the clients table is empty."""
+    if not query("SELECT COUNT(*) FROM api_auth.clients", auth=True)[0]:
+        query("INSERT INTO api_auth.clients (client_id, secret_hash) VALUES (%s, %s)",
+              params=(os.getenv("API_CLIENT_ID", "app"),
+                      auth.hash_password(os.environ["API_CLIENT_SECRET"])),
               auth=True)
-        logging.info("Created initial admin user")
+        logging.info("Created initial API client")
     yield
 
 
@@ -152,125 +149,50 @@ async def api():
     """
     return APIResponse(code=200, message=f"MySQL API version {__version__}")
 
-# ------------------- AUTH ENDPOINTS -------------------
+# ------------------- AUTH ENDPOINTS (API CLIENTS) -------------------
 
 
-def issue_tokens(user_id: int, username: str) -> TokenResponse:
-    """New short-lived access token + refresh token (stored as hash, single use)."""
-    refresh_token = auth.new_token()
-    query("DELETE FROM api_auth.refresh_tokens WHERE expires_at < NOW()", auth=True)
-    query("INSERT INTO api_auth.refresh_tokens (token_hash, user_id, expires_at) "
-          "VALUES (%s, %s, NOW() + INTERVAL %s HOUR)",
-          params=(auth.token_hash(refresh_token), user_id, auth.REFRESH_HOURS), auth=True)
-    return TokenResponse(access_token=auth.create_access_token(username),
-                         refresh_token=refresh_token, expires_in=auth.ACCESS_MINUTES * 60)
+@app.post("/auth/token", tags=["Auth"], response_model=TokenResponse)
+def token(request: TokenRequest):
+    """OAuth2 client credentials: exchange client_id + client_secret for a JWT access token."""
+    rows = query("SELECT secret_hash FROM api_auth.clients WHERE client_id=%s",
+                 params=(request.client_id,), auth=True)
+    if not (auth.verify_password(request.client_secret, rows[0] if rows else auth.DUMMY_HASH)
+            and rows):
+        logging.warning("Failed token request for client %r", request.client_id)
+        raise HTTPException(status_code=401, detail="Bad client credentials")
+    return TokenResponse(access_token=auth.create_access_token(request.client_id),
+                         expires_in=auth.ACCESS_MINUTES * 60)
 
 
-@app.post("/login", tags=["Auth"], response_model=TokenResponse)
-def login(request: LoginRequest):
-    """Exchange username, password (and TOTP code if enabled) for access + refresh tokens."""
-    rows = query("SELECT id, password_hash, totp_secret, totp_last_step FROM api_auth.users "
-                 "WHERE username=%s", params=(request.username,), auth=True)
-    user_id, password_hash, totp_secret, last_step = \
-        rows[0] if rows else (None, auth.DUMMY_HASH, None, None)
-    ok = auth.verify_password(request.password, password_hash) and bool(rows)
-    if ok and totp_secret:
-        step = auth.totp_step(totp_secret, request.totp, last_step)
-        ok = step is not None
-        if ok:
-            query("UPDATE api_auth.users SET totp_last_step=%s WHERE id=%s",
-                  params=(step, user_id), auth=True)
-    if not ok:
-        logging.warning("Failed login for user %r", request.username)
-        raise HTTPException(status_code=401, detail="Bad credentials")
-    return issue_tokens(user_id, request.username)
+@app.post("/auth/clients", tags=["Auth"], response_model=APIResponse, dependencies=Protected)
+def create_client(request: ClientCreate):
+    """Register a new API client. The secret is shown only once."""
+    secret = auth.new_secret()
+    query("INSERT INTO api_auth.clients (client_id, secret_hash) VALUES (%s, %s)",
+          params=(request.client_id, auth.hash_password(secret)), auth=True)
+    return APIResponse(code=200, message="Store the secret now, it won't be shown again",
+                       data={"client_id": request.client_id, "client_secret": secret})
 
 
-@app.post("/auth/refresh", tags=["Auth"], response_model=TokenResponse)
-def refresh(request: RefreshRequest):
-    """Get a new access token without password/TOTP. The refresh token is rotated:
-    the used one stops working and a new one is returned."""
-    hashed = auth.token_hash(request.refresh_token)
-    rows = query("SELECT u.id, u.username FROM api_auth.refresh_tokens t "
-                 "JOIN api_auth.users u ON u.id = t.user_id "
-                 "WHERE t.token_hash=%s AND t.expires_at > NOW()", params=(hashed,), auth=True)
-    query("DELETE FROM api_auth.refresh_tokens WHERE token_hash=%s", params=(hashed,), auth=True)
-    if not rows:
-        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
-    return issue_tokens(*rows[0])
+@app.get("/auth/clients", tags=["Auth"], response_model=APIResponse, dependencies=Protected)
+def list_clients():
+    """List API clients (without secrets)."""
+    rows = query("SELECT client_id, created_at FROM api_auth.clients ORDER BY id", auth=True)
+    return APIResponse(code=200, message="API clients",
+                       data=[dict(zip(("client_id", "created_at"), row)) for row in rows])
 
 
-@app.post("/auth/logout", tags=["Auth"], response_model=APIResponse)
-def logout(request: RefreshRequest):
-    """Revoke the refresh token (the access token expires on its own within minutes)."""
-    query("DELETE FROM api_auth.refresh_tokens WHERE token_hash=%s",
-          params=(auth.token_hash(request.refresh_token),), auth=True)
-    return APIResponse(code=200, message="Logged out")
-
-
-@app.post("/auth/totp/setup", tags=["Auth"], response_model=APIResponse)
-def totp_setup(username: SessionUser):
-    """Generate a new TOTP secret. Scan `uri` as QR code, then confirm with /auth/totp/enable."""
-    secret = pyotp.random_base32()
-    uri = pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name="MySQL API")
-    return APIResponse(code=200, message="Scan the URI and confirm with a code",
-                       data={"secret": secret, "uri": uri})
-
-
-@app.post("/auth/totp/enable", tags=["Auth"], response_model=APIResponse)
-def totp_enable(request: TotpEnableRequest, username: SessionUser):
-    """Enable TOTP after proving the authenticator app generates valid codes."""
-    step = auth.totp_step(request.secret, request.code)
-    if step is None:
-        raise HTTPException(status_code=400, detail="Invalid TOTP code")
-    query("UPDATE api_auth.users SET totp_secret=%s, totp_last_step=%s WHERE username=%s",
-          params=(request.secret, step, username), auth=True)
-    return APIResponse(code=200, message="TOTP enabled, it is now required at login")
-
-
-@app.delete("/auth/totp", tags=["Auth"], response_model=APIResponse)
-def totp_disable(request: TotpCodeRequest, username: SessionUser):
-    """Disable TOTP, confirmed with a current code from the authenticator app."""
-    secret = query("SELECT totp_secret FROM api_auth.users WHERE username=%s",
-                   params=(username,), auth=True)
-    if not secret or not secret[0] or auth.totp_step(secret[0], request.code) is None:
-        raise HTTPException(status_code=400, detail="TOTP not enabled or invalid code")
-    query("UPDATE api_auth.users SET totp_secret=NULL, totp_last_step=NULL WHERE username=%s",
-          params=(username,), auth=True)
-    return APIResponse(code=200, message="TOTP disabled")
-
-
-@app.post("/auth/api-keys", tags=["Auth"], response_model=APIResponse)
-def create_api_key(request: ApiKeyCreate, username: SessionUser):
-    """Create an API key for scripts (no TOTP needed). The key is shown only once."""
-    key = auth.new_token(auth.API_KEY_PREFIX)
-    query("INSERT INTO api_auth.api_keys (user_id, name, key_hash) "
-          "SELECT id, %s, %s FROM api_auth.users WHERE username=%s",
-          params=(request.name, auth.token_hash(key), username), auth=True)
-    return APIResponse(code=200, message="Store the key now, it won't be shown again",
-                       data={"name": request.name, "key": key})
-
-
-@app.get("/auth/api-keys", tags=["Auth"], response_model=APIResponse)
-def list_api_keys(username: SessionUser):
-    """List your API keys (without the keys themselves)."""
-    rows = query("SELECT k.id, k.name, k.created_at FROM api_auth.api_keys k "
-                 "JOIN api_auth.users u ON u.id = k.user_id WHERE u.username=%s ORDER BY k.id",
-                 params=(username,), auth=True)
-    return APIResponse(code=200, message="API keys",
-                       data=[dict(zip(("id", "name", "created_at"), row)) for row in rows])
-
-
-@app.delete("/auth/api-keys/{key_id}", tags=["Auth"], response_model=APIResponse)
-def delete_api_key(key_id: int, username: SessionUser):
-    """Revoke one of your API keys."""
-    owned = query("SELECT k.id FROM api_auth.api_keys k JOIN api_auth.users u "
-                  "ON u.id = k.user_id WHERE k.id=%s AND u.username=%s",
-                  params=(key_id, username), auth=True)
-    if not owned:
-        raise HTTPException(status_code=404, detail="API key not found")
-    query("DELETE FROM api_auth.api_keys WHERE id=%s", params=(key_id,), auth=True)
-    return APIResponse(code=200, message="API key revoked")
+@app.delete("/auth/clients/{client_id}", tags=["Auth"], response_model=APIResponse)
+def delete_client(client_id: str, current: CurrentClient):
+    """Revoke an API client (its current tokens expire within ACCESS_MINUTES)."""
+    if client_id == current:
+        raise HTTPException(status_code=400, detail="Can't delete the client you are using")
+    if not query("SELECT id FROM api_auth.clients WHERE client_id=%s",
+                 params=(client_id,), auth=True):
+        raise HTTPException(status_code=404, detail="Client not found")
+    query("DELETE FROM api_auth.clients WHERE client_id=%s", params=(client_id,), auth=True)
+    return APIResponse(code=200, message="Client deleted")
 
 # ------------------- DATABASE ENDPOINTS -------------------
 
@@ -502,14 +424,15 @@ def delete_row(request: RowDeleteRequest):
           request.database_name, params=(request.row_id,))
     return APIResponse(code=200, message='Row deleted')
 
-# ------------------- USER MANAGEMENT ENDPOINTS -------------------
+# ------------------- APPLICATION USER ENDPOINTS -------------------
 
 
-USER_COLUMNS = "id, username, email, totp_secret IS NOT NULL"
+USER_COLUMNS = "id, username, email, totp_secret IS NOT NULL, locked_until > NOW()"
 
 
 def user_dict(row) -> dict:
-    return dict(zip(("id", "username", "email", "totp_enabled"), row[:3] + (bool(row[3]),)))
+    return dict(zip(("id", "username", "email", "totp_enabled", "locked"),
+                    row[:3] + (bool(row[3]), bool(row[4]))))
 
 
 def fetch_user(user_id: int) -> dict:
@@ -520,14 +443,103 @@ def fetch_user(user_id: int) -> dict:
     return user_dict(rows[0])
 
 
+@app.post("/user/login",
+          tags=["User"],
+          response_model=APIResponse,
+          summary="Verify user login",
+          dependencies=Protected,
+          responses={401: {"description": "Bad credentials or TOTP code required"},
+                     423: {"description": "Account locked after too many failed attempts"}}
+          )
+def user_login(request: UserLoginRequest):
+    """Check password (and TOTP if enabled) of an application user.
+
+    Returns the user on success; the application then starts its own session.
+    If the password is right but TOTP is enabled and `totp` is missing, returns 401
+    "TOTP code required" so the application can ask for it and retry.
+    After MAX_FAILED_LOGINS wrong attempts the account is locked for LOCK_MINUTES.
+    """
+    rows = query("SELECT id, password_hash, totp_secret, totp_last_step, "
+                 "locked_until > NOW() FROM api_auth.users WHERE username=%s",
+                 params=(request.username,), auth=True)
+    user_id, password_hash, totp_secret, last_step, locked = \
+        rows[0] if rows else (None, auth.DUMMY_HASH, None, None, False)
+    if locked:
+        raise HTTPException(status_code=423, detail="Account locked, try again later")
+    password_ok = auth.verify_password(request.password, password_hash) and bool(rows)
+    if password_ok and totp_secret and not request.totp:
+        raise HTTPException(status_code=401, detail="TOTP code required")
+    step = auth.totp_step(totp_secret, request.totp, last_step) if totp_secret else None
+    if not password_ok or (totp_secret and step is None):
+        if rows:
+            query("UPDATE api_auth.users SET failed_logins = failed_logins + 1, "
+                  "locked_until = IF(failed_logins >= %s, NOW() + INTERVAL %s MINUTE, NULL), "
+                  "failed_logins = IF(failed_logins >= %s, 0, failed_logins) WHERE id=%s",
+                  params=(auth.MAX_FAILED_LOGINS, auth.LOCK_MINUTES, auth.MAX_FAILED_LOGINS,
+                          user_id), auth=True)
+        logging.warning("Failed login for user %r", request.username)
+        raise HTTPException(status_code=401, detail="Bad credentials")
+    query("UPDATE api_auth.users SET failed_logins=0, locked_until=NULL, "
+          "totp_last_step=COALESCE(%s, totp_last_step) WHERE id=%s",
+          params=(step, user_id), auth=True)
+    return APIResponse(code=200, message="Login successful", data=fetch_user(user_id))
+
+
+@app.post("/user/{user_id}/totp/setup",
+          tags=["User"],
+          response_model=APIResponse,
+          summary="Generate TOTP secret",
+          dependencies=Protected
+          )
+def user_totp_setup(user_id: int):
+    """New TOTP secret for the user. Show `uri` as QR code, then confirm with .../totp/enable.
+    Nothing is saved until confirmed."""
+    user = fetch_user(user_id)
+    secret = pyotp.random_base32()
+    uri = pyotp.TOTP(secret).provisioning_uri(name=user["username"], issuer_name="MySQL API")
+    return APIResponse(code=200, message="Show the URI as QR code and confirm with a code",
+                       data={"secret": secret, "uri": uri})
+
+
+@app.post("/user/{user_id}/totp/enable",
+          tags=["User"],
+          response_model=APIResponse,
+          summary="Enable TOTP",
+          dependencies=Protected
+          )
+def user_totp_enable(user_id: int, request: TotpEnableRequest):
+    """Enable TOTP after the user proves their authenticator app generates valid codes."""
+    fetch_user(user_id)
+    step = auth.totp_step(request.secret, request.code)
+    if step is None:
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+    query("UPDATE api_auth.users SET totp_secret=%s, totp_last_step=%s WHERE id=%s",
+          params=(request.secret, step, user_id), auth=True)
+    return APIResponse(code=200, message="TOTP enabled, it is now required at login")
+
+
+@app.delete("/user/{user_id}/totp",
+            tags=["User"],
+            response_model=APIResponse,
+            summary="Disable TOTP",
+            dependencies=Protected
+            )
+def user_totp_disable(user_id: int):
+    """Disable TOTP (e.g. lost phone). The application decides who may do this."""
+    fetch_user(user_id)
+    query("UPDATE api_auth.users SET totp_secret=NULL, totp_last_step=NULL WHERE id=%s",
+          params=(user_id,), auth=True)
+    return APIResponse(code=200, message="TOTP disabled")
+
+
 @app.get("/user",
          tags=["User"],
          response_model=APIResponse,
          summary="List users",
-         dependencies=SessionProtected
+         dependencies=Protected
          )
 def list_users():
-    """List all API users."""
+    """List all application users."""
     rows = query(f"SELECT {USER_COLUMNS} FROM api_auth.users ORDER BY id", auth=True)
     return APIResponse(code=200, message="Users fetched", data=[user_dict(r) for r in rows])
 
@@ -536,8 +548,8 @@ def list_users():
           tags=["User"],
           response_model=APIResponse,
           summary="Create a new user",
-          description="Create a new API user. Password is stored as a scrypt hash.",
-          dependencies=SessionProtected
+          description="Create a new application user. Password is stored as a scrypt hash.",
+          dependencies=Protected
           )
 def create_user(user: UserCreate):
     """Create a new user."""
@@ -553,7 +565,7 @@ def create_user(user: UserCreate):
          response_model=APIResponse,
          summary="Get user by ID",
          description="Fetch a user by their unique ID.",
-         dependencies=SessionProtected
+         dependencies=Protected
          )
 def get_user(user_id: int):
     """Get user by ID."""
@@ -564,8 +576,8 @@ def get_user(user_id: int):
          tags=["User"],
          response_model=APIResponse,
          summary="Update user by ID",
-         description="Update user email and/or password by their unique ID.",
-         dependencies=SessionProtected
+         description="Update email and/or password. A password change also unlocks the account.",
+         dependencies=Protected
          )
 def update_user(user_id: int, user: UserUpdate):
     """Update user by ID."""
@@ -574,10 +586,8 @@ def update_user(user_id: int, user: UserUpdate):
         query("UPDATE api_auth.users SET email=%s WHERE id=%s",
               params=(user.email, user_id), auth=True)
     if user.password is not None:
-        query("UPDATE api_auth.users SET password_hash=%s WHERE id=%s",
-              params=(auth.hash_password(user.password), user_id), auth=True)
-        # log out everywhere: existing refresh tokens stop working
-        query("DELETE FROM api_auth.refresh_tokens WHERE user_id=%s", params=(user_id,), auth=True)
+        query("UPDATE api_auth.users SET password_hash=%s, failed_logins=0, locked_until=NULL "
+              "WHERE id=%s", params=(auth.hash_password(user.password), user_id), auth=True)
     return APIResponse(code=200, message="User updated", data=fetch_user(user_id))
 
 
@@ -586,7 +596,7 @@ def update_user(user_id: int, user: UserUpdate):
             response_model=APIResponse,
             summary="Delete user by ID",
             description="Delete a user by their unique ID.",
-            dependencies=SessionProtected
+            dependencies=Protected
             )
 def delete_user(user_id: int):
     """Delete user by ID."""

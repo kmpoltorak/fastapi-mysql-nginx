@@ -5,6 +5,14 @@ set -e
 
 mysql --protocol=socket -uroot -p"${MYSQL_ROOT_PASSWORD}" <<-EOSQL
 	CREATE DATABASE api_auth;
+	-- Applications/scripts allowed to call the API (OAuth2 client credentials -> JWT)
+	CREATE TABLE api_auth.clients (
+	    id INT AUTO_INCREMENT PRIMARY KEY,
+	    client_id VARCHAR(64) NOT NULL UNIQUE,
+	    secret_hash VARCHAR(255) NOT NULL,
+	    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	-- Users of the application, verified by POST /user/login (password + optional TOTP)
 	CREATE TABLE api_auth.users (
 	    id INT AUTO_INCREMENT PRIMARY KEY,
 	    username VARCHAR(64) NOT NULL UNIQUE,
@@ -12,25 +20,12 @@ mysql --protocol=socket -uroot -p"${MYSQL_ROOT_PASSWORD}" <<-EOSQL
 	    password_hash VARCHAR(255) NOT NULL,
 	    totp_secret VARCHAR(64) NULL,
 	    totp_last_step BIGINT NULL,  -- last accepted TOTP time step, blocks code reuse
+	    failed_logins INT NOT NULL DEFAULT 0,
+	    locked_until DATETIME NULL,  -- set after too many failed logins
 	    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
-	-- Tokens and keys are random 256-bit values, only their SHA-256 is stored
-	CREATE TABLE api_auth.refresh_tokens (
-	    token_hash CHAR(64) PRIMARY KEY,
-	    user_id INT NOT NULL,
-	    expires_at DATETIME NOT NULL,
-	    FOREIGN KEY (user_id) REFERENCES api_auth.users(id) ON DELETE CASCADE
-	);
-	CREATE TABLE api_auth.api_keys (
-	    id INT AUTO_INCREMENT PRIMARY KEY,
-	    user_id INT NOT NULL,
-	    name VARCHAR(64) NOT NULL,
-	    key_hash CHAR(64) NOT NULL UNIQUE,
-	    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	    FOREIGN KEY (user_id) REFERENCES api_auth.users(id) ON DELETE CASCADE
-	);
 
-	-- Login/user management: only rows of the auth tables, no DDL
+	-- Clients and users: only rows of the auth tables, no DDL
 	CREATE USER 'api_auth'@'%' IDENTIFIED BY '${AUTH_DB_PASSWORD}';
 	GRANT SELECT, INSERT, UPDATE, DELETE ON api_auth.* TO 'api_auth'@'%';
 

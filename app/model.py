@@ -39,35 +39,31 @@ class UserUpdate(BaseModel):
 
 
 # Auth models
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    totp: Optional[str] = None
+class TokenRequest(BaseModel):
+    client_id: str
+    client_secret: str
 
-    model_config = example(username="admin", password="secret", totp="123456")
+    model_config = example(client_id="app", client_secret="secret-from-env")
 
 
 class TokenResponse(BaseModel):
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
-    expires_in: int  # access token lifetime in seconds
+    expires_in: int  # seconds
 
 
-class RefreshRequest(BaseModel):
-    refresh_token: str
+class ClientCreate(BaseModel):
+    client_id: str = Field(min_length=1, max_length=64)
+
+    model_config = example(client_id="nightly-backup")
 
 
-class TotpCodeRequest(BaseModel):
-    code: str
+class UserLoginRequest(BaseModel):
+    username: str
+    password: str
+    totp: Optional[str] = None
 
-    model_config = example(code="123456")
-
-
-class ApiKeyCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=64)
-
-    model_config = example(name="nightly-backup")
+    model_config = example(username="johndoe", password="strongpassword", totp="123456")
 
 
 class TotpEnableRequest(BaseModel):

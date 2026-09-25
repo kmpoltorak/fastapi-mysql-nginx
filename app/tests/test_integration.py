@@ -33,17 +33,18 @@ def call(method, path, body=None, token=None, url=None):
         return e.code, json.load(e)
 
 
-def login(username, password, totp=None, full=False):
-    status, body = call("POST", "/login",
-                        {"username": username, "password": password, "totp": totp})
-    if status != 200:
-        return status
-    return body if full else body["access_token"]
-
-
 @pytest.fixture(scope="module")
 def token():
-    return login(os.getenv("ADMIN_USERNAME", "admin"), os.environ["ADMIN_PASSWORD"])
+    status, body = call("POST", "/auth/token", {
+        "client_id": os.getenv("API_CLIENT_ID", "app"),
+        "client_secret": os.environ["API_CLIENT_SECRET"]})
+    assert status == 200 and body["expires_in"] == 900
+    return body["access_token"]
+
+
+def user_login(token, username, password, totp=None):
+    return call("POST", "/user/login",
+                {"username": username, "password": password, "totp": totp}, token)
 
 
 def test_http_redirects_to_https():
@@ -56,11 +57,25 @@ def test_http_redirects_to_https():
     assert e.value.code == 301
 
 
-def test_auth(token):
-    assert isinstance(token, str)
-    assert login("admin", "wrong") == 401
-    assert login("nobody", "wrong") == 401
+def test_client_auth(token):
+    assert call("POST", "/auth/token", {"client_id": "app", "client_secret": "wrong"})[0] == 401
+    assert call("POST", "/auth/token", {"client_id": "nobody", "client_secret": "x"})[0] == 401
     assert call("GET", "/database/get")[0] == 401
+    assert call("GET", "/database/get", token=token)[0] == 200
+
+
+def test_clients(token):
+    status, body = call("POST", "/auth/clients", {"client_id": "it-script"}, token)
+    assert status == 200
+    status, new = call("POST", "/auth/token", {"client_id": "it-script",
+                                               "client_secret": body["data"]["client_secret"]})
+    assert status == 200
+    ids = [c["client_id"] for c in call("GET", "/auth/clients", token=token)[1]["data"]]
+    assert "it-script" in ids
+    assert call("DELETE", "/auth/clients/it-script", token=new["access_token"])[0] == 400
+    assert call("DELETE", "/auth/clients/it-script", token=token)[0] == 200
+    assert call("POST", "/auth/token", {"client_id": "it-script",
+                                        "client_secret": body["data"]["client_secret"]})[0] == 401
 
 
 def test_database_flow(token):
@@ -106,32 +121,7 @@ def test_db_user_cannot_touch_system_or_auth_data(token):
     call("DELETE", "/database/delete", {"database_name": "it_sec"}, token)
 
 
-def test_refresh_and_logout():
-    tokens = login(os.getenv("ADMIN_USERNAME", "admin"), os.environ["ADMIN_PASSWORD"], full=True)
-    assert tokens["expires_in"] == 900
-    status, renewed = call("POST", "/auth/refresh", {"refresh_token": tokens["refresh_token"]})
-    assert status == 200 and renewed["refresh_token"] != tokens["refresh_token"]
-    assert call("GET", "/database/get", token=renewed["access_token"])[0] == 200
-    # rotation: a used refresh token can't be used again
-    assert call("POST", "/auth/refresh", {"refresh_token": tokens["refresh_token"]})[0] == 401
-    assert call("POST", "/auth/logout", {"refresh_token": renewed["refresh_token"]})[0] == 200
-    assert call("POST", "/auth/refresh", {"refresh_token": renewed["refresh_token"]})[0] == 401
-
-
-def test_api_keys(token):
-    status, body = call("POST", "/auth/api-keys", {"name": "it-script"}, token)
-    assert status == 200
-    key = body["data"]["key"]
-    assert call("GET", "/database/get", token=key)[0] == 200
-    assert call("GET", "/user", token=key)[0] == 403  # keys can't manage accounts
-    keys = call("GET", "/auth/api-keys", token=token)[1]["data"]
-    key_id = next(k["id"] for k in keys if k["name"] == "it-script")
-    assert "key" not in keys[0]
-    assert call("DELETE", f"/auth/api-keys/{key_id}", token=token)[0] == 200
-    assert call("GET", "/database/get", token=key)[0] == 401
-
-
-def test_users_and_totp(token):
+def test_user_login_totp_and_lockout(token):
     status, body = call("POST", "/user", {"username": "it_user", "email": "a@b.c",
                                           "password": "pw1"}, token)
     assert status == 200 and "password_hash" not in body["data"]
@@ -139,23 +129,35 @@ def test_users_and_totp(token):
     try:
         assert call("POST", "/user", {"username": "it_user", "email": "a@b.c",
                                       "password": "pw1"}, token)[0] == 400
-        user_token = login("it_user", "pw1")
-        secret = call("POST", "/auth/totp/setup", token=user_token)[1]["data"]["secret"]
-        assert call("POST", "/auth/totp/enable",
-                    {"secret": secret, "code": "abcdef"}, user_token)[0] == 400
+        status, body = user_login(token, "it_user", "pw1")
+        assert status == 200 and body["data"]["id"] == user_id
+        assert user_login(token, "it_user", "bad")[0] == 401
+        assert user_login(token, "nobody", "bad")[0] == 401
+
+        # TOTP
+        secret = call("POST", f"/user/{user_id}/totp/setup", token=token)[1]["data"]["secret"]
+        assert call("POST", f"/user/{user_id}/totp/enable",
+                    {"secret": secret, "code": "abcdef"}, token)[0] == 400
         totp = pyotp.TOTP(secret)
-        assert call("POST", "/auth/totp/enable",
-                    {"secret": secret, "code": totp.now()}, user_token)[0] == 200
-        assert login("it_user", "pw1") == 401
-        # the enable code is used up; next 30 s code is still accepted (clock drift window)
-        assert login("it_user", "pw1", totp.now()) == 401
-        next_code = totp.at(time.time() + 30)
-        assert isinstance(login("it_user", "pw1", next_code), str)
-        assert login("it_user", "pw1", next_code) == 401  # replay
+        assert call("POST", f"/user/{user_id}/totp/enable",
+                    {"secret": secret, "code": totp.now()}, token)[0] == 200
+        status, body = user_login(token, "it_user", "pw1")
+        assert status == 401 and body["detail"] == "TOTP code required"
+        assert user_login(token, "it_user", "pw1", totp.now())[0] == 401  # used by enable
+        next_code = totp.at(time.time() + 30)  # still inside the clock drift window
+        assert user_login(token, "it_user", "pw1", next_code)[0] == 200
+        assert user_login(token, "it_user", "pw1", next_code)[0] == 401  # replay
         assert call("GET", f"/user/{user_id}", token=token)[1]["data"]["totp_enabled"] is True
-        assert call("DELETE", "/auth/totp", {"code": "abcdef"}, user_token)[0] == 400
-        assert call("DELETE", "/auth/totp", {"code": totp.now()}, user_token)[0] == 200
-        assert isinstance(login("it_user", "pw1"), str)
+        assert call("DELETE", f"/user/{user_id}/totp", token=token)[0] == 200
+        assert user_login(token, "it_user", "pw1")[0] == 200
+
+        # lockout after 5 failed attempts, password change unlocks
+        for _ in range(5):
+            assert user_login(token, "it_user", "bad")[0] == 401
+        assert user_login(token, "it_user", "pw1")[0] == 423
+        assert call("GET", f"/user/{user_id}", token=token)[1]["data"]["locked"] is True
+        assert call("PUT", f"/user/{user_id}", {"password": "pw2"}, token)[0] == 200
+        assert user_login(token, "it_user", "pw2")[0] == 200
     finally:
         assert call("DELETE", f"/user/{user_id}", token=token)[0] == 200
     assert call("GET", f"/user/{user_id}", token=token)[0] == 404

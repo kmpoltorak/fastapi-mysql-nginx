@@ -1,99 +1,97 @@
-# Overview
-MySQL on backend with FastAPI on frontend accessed via Nginx created for dev and scientific purposes like learning how to build simple application based on docker microservices. API can be triggered by Postman, curl etc.
+# FastAPI + MySQL + Nginx Microservice
 
-# Features
-1. Actions on databases
-2. Actions on tables
-3. Actions on rows - To Do
-4. Actions on user - To Do
+This project is a simple microservice stack for development and learning purposes. It provides a REST API (FastAPI) for MySQL database management, served behind Nginx. All services are containerized with Docker Compose.
 
-# Prerequirements
-* Docker installed
-* Docker compose installed
+## Features
 
-# Environment variables
-In docker-compose.yml you can change environment variables like:
-- `MYSQL_HOST`
-- `MYSQL_USER`
-- `MYSQL_ROOT_PASSWORD`
-- `API_KEY`
-- `TZ`
+- Database management: create, list, delete, backup, restore
+- Table management: create, list, delete, rename, describe columns
+- Row management: insert, get, update, delete
+- User management: create, get, update, delete (in-memory demo)
+- API authentication via token (header: `AccessToken`)
+- Linting (flake8) and tests (pytest), run in GitHub Actions CI
 
-# Deploy
-- `docker compose build && docker compose up -d`
+## Requirements
 
-Recreate after changes:
-- `docker compose build && docker compose up -d --force-recreate`
+- Docker
+- Docker Compose
 
-To setup SSL certificate on Nginx:
-1. modify configuration in `nginx/fastapi.conf`
-2. add certificate and key to the `nginx/` directory
-3. add COPY statement to `nginx/Dockerfile`
-- `COPY certificate* /etc/ssl/`
-4. copy SSL certificate and key files to `/etc/ssl`
-5. change/add expose port of Nginx to 443 in docker-compose proxy section
+## Environment Variables
 
-You can add permanent redirection from 80 to 443 to `nginx/fastapi.conf` config file like on example below (to be tested)
-```
-server {
-    listen 80;
-    server_name _;
-    return 301 https://$host$request_uri;
-}
-server {
-    listen       443;
-    server_name  localhost;
-    ssl on;
-    ssl_certificate     /etc/ssl/certificate.crt;
-    ssl_certificate_key /etc/ssl/certificate_private_key.key;
-    location / {
-        proxy_pass   http://app:8080;
-    }
-}
-```
+Copy `.env.example` to `.env` and adjust values (Docker Compose reads it automatically; defaults are used when unset):
 
-Before you use SSL configuration in Nginx remove passphrase from certificate key if exists using OpenSSL
+- `MYSQL_HOST` - MySQL host (default: db)
+- `MYSQL_USER` - MySQL user (default: root)
+- `MYSQL_ROOT_PASSWORD` - MySQL root password
+- `API_KEY` - API authentication token
+- `TZ` - Timezone
 
-# Example result
+## Deployment
+
+Build and start all services:
 
 ```
-kmpoltorak@git:~$ docker ps
-CONTAINER ID   IMAGE                       COMMAND                  CREATED      STATUS        PORTS                               NAMES
-de821c32170d   fastapi-mysql-nginx_proxy   "/docker-entrypoint.…"   4 days ago   Up 23 hours   0.0.0.0:80->80/tcp, :::80->80/tcp   fastapi-mysql-nginx-proxy-1
-469beba2fc60   fastapi-mysql-nginx_app     "hypercorn app:app -…"   4 days ago   Up 23 hours   8080/tcp                            fastapi-mysql-nginx-app-1
-70687d5a6a2d   mysql:latest                "docker-entrypoint.s…"   4 days ago   Up 23 hours   3306/tcp, 33060/tcp                 fastapi-mysql-nginx-db-1
+docker compose build && docker compose up -d
 ```
 
-# API requests
-API requests can be made by the FastAPI SWAGGER-like GUI or via other tool like curl or Postman. API authentication is based on token provided as environment variable in `docker-compose.yml`
+Rebuild after changes:
 
-To create table you have to provide it fields params SQL=like, see example data below:
 ```
+docker compose build && docker compose up -d --force-recreate
+```
+
+## Nginx SSL Setup (optional)
+
+1. Edit `nginx/fastapi.conf` for SSL configuration
+2. Add your certificate and key to the `nginx/` directory
+3. Add to `nginx/Dockerfile`:
+   ```
+   COPY certificate* /etc/ssl/
+   ```
+4. Expose port 443 in the `proxy` service in `docker-compose.yml`
+5. (Optional) Add HTTP->HTTPS redirect in `nginx/fastapi.conf`:
+   ```
+   server {
+       listen 80;
+       server_name _;
+       return 301 https://$host$request_uri;
+   }
+   ```
+
+**Note:** Remove passphrase from your certificate key if present (see OpenSSL docs).
+
+## Example: Running Containers
+
+After starting the services, check running containers:
+```sh
+$ docker ps
+CONTAINER ID   IMAGE                       COMMAND                  ...
+...           fastapi-mysql-nginx_proxy   ...
+...           fastapi-mysql-nginx_app     ...
+...           mysql:8.3                   ...
+```
+
+## API Usage
+
+You can use the FastAPI Swagger UI (available at `/`) or tools like curl/Postman. All endpoints except `/health` require the `AccessToken` header with the value set to your `API_KEY`.
+
+### Example: Create Table
+
+Request:
+```
+POST /table/create
 {
   "database_name": "test",
   "table_name": "person",
   "columns": [
-    {
-      "name": "id",
-      "params": "int not null auto_increment"
-    },
-    {
-      "name": "name",
-      "params": "varchar(255)"
-    },
-    {
-      "name": "surname",
-      "params": "varchar(255) not null"
-    },
-    {
-      "name": "primary key",
-      "params": "(id)"
-    }
+    { "name": "id", "params": "int not null auto_increment primary key" },
+    { "name": "name", "params": "varchar(255)" },
+    { "name": "surname", "params": "varchar(255) not null" }
   ]
 }
 ```
 
-Output from MySQL database:
+Result in MySQL:
 ```
 mysql> show columns from person;
 +---------+--------------+------+-----+---------+----------------+
@@ -103,5 +101,36 @@ mysql> show columns from person;
 | name    | varchar(255) | YES  |     | NULL    |                |
 | surname | varchar(255) | NO   |     | NULL    |                |
 +---------+--------------+------+-----+---------+----------------+
-3 rows in set (0.02 sec)
+```
+
+### Database Backup & Restore
+
+**Backup:**
+```
+POST /database/backup
+{
+  "database_name": "testdb"
+}
+```
+Response: SQL dump string in `data` field.
+
+**Restore:**
+```
+POST /database/restore
+{
+  "database_name": "testdb",
+  "sql_dump": "CREATE TABLE ...; INSERT INTO ...; ..."
+}
+```
+
+**Note:** The SQL dump must be valid MySQL SQL. The operation is executed directly on the database.
+
+## Linting & Tests
+
+Tests mock the database, so no MySQL is needed:
+
+```
+pip install -r app/requirements.txt flake8 pytest httpx
+flake8 app
+cd app && python -m pytest
 ```

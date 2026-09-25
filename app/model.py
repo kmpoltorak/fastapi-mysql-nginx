@@ -1,5 +1,5 @@
 from typing import Any, Literal, Optional, List
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import re
 
 
@@ -49,7 +49,25 @@ class LoginRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
+    expires_in: int  # access token lifetime in seconds
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class TotpCodeRequest(BaseModel):
+    code: str
+
+    model_config = example(code="123456")
+
+
+class ApiKeyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+
+    model_config = example(name="nightly-backup")
 
 
 class TotpEnableRequest(BaseModel):

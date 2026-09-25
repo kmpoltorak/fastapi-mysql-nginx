@@ -25,8 +25,11 @@ from model import (
     RowDeleteRequest,
     DatabaseBackupRequest,
     DatabaseRestoreRequest,
+    ApiKeyCreate,
     LoginRequest,
+    RefreshRequest,
     TokenResponse,
+    TotpCodeRequest,
     TotpEnableRequest,
     UserCreate,
     UserUpdate
@@ -34,7 +37,9 @@ from model import (
 
 Identifier = Annotated[str, Path(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
 CurrentUser = Annotated[str, Depends(auth.get_current_user)]
+SessionUser = Annotated[str, Depends(auth.get_session_user)]
 Protected = [Depends(auth.get_current_user)]
+SessionProtected = [Depends(auth.get_session_user)]
 
 # Request tags
 tags_metadata = [
@@ -44,8 +49,9 @@ tags_metadata = [
     },
     {
         "name": "Auth",
-        "description": """Log in with `/login`, then click **Authorize** and paste
-        the `access_token`. Optional TOTP two-factor authentication."""
+        "description": """People: log in with `/login` (+ TOTP if enabled), click
+        **Authorize** and paste the `access_token`; renew it with `/auth/refresh`.
+        Scripts: create an API key and use it the same way (Bearer)."""
     },
     {
         "name": "Database",
@@ -67,7 +73,7 @@ tags_metadata = [
     }
 ]
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 @asynccontextmanager
@@ -149,23 +155,61 @@ async def api():
 # ------------------- AUTH ENDPOINTS -------------------
 
 
+def issue_tokens(user_id: int, username: str) -> TokenResponse:
+    """New short-lived access token + refresh token (stored as hash, single use)."""
+    refresh_token = auth.new_token()
+    query("DELETE FROM api_auth.refresh_tokens WHERE expires_at < NOW()", auth=True)
+    query("INSERT INTO api_auth.refresh_tokens (token_hash, user_id, expires_at) "
+          "VALUES (%s, %s, NOW() + INTERVAL %s HOUR)",
+          params=(auth.token_hash(refresh_token), user_id, auth.REFRESH_HOURS), auth=True)
+    return TokenResponse(access_token=auth.create_access_token(username),
+                         refresh_token=refresh_token, expires_in=auth.ACCESS_MINUTES * 60)
+
+
 @app.post("/login", tags=["Auth"], response_model=TokenResponse)
 def login(request: LoginRequest):
-    """Exchange username, password (and TOTP code if enabled) for a Bearer token."""
-    rows = query("SELECT password_hash, totp_secret FROM api_auth.users WHERE username=%s",
-                 params=(request.username,), auth=True)
-    password_hash, totp_secret = rows[0] if rows else (auth.DUMMY_HASH, None)
+    """Exchange username, password (and TOTP code if enabled) for access + refresh tokens."""
+    rows = query("SELECT id, password_hash, totp_secret, totp_last_step FROM api_auth.users "
+                 "WHERE username=%s", params=(request.username,), auth=True)
+    user_id, password_hash, totp_secret, last_step = \
+        rows[0] if rows else (None, auth.DUMMY_HASH, None, None)
     ok = auth.verify_password(request.password, password_hash) and bool(rows)
     if ok and totp_secret:
-        ok = auth.verify_totp(totp_secret, request.totp)
+        step = auth.totp_step(totp_secret, request.totp, last_step)
+        ok = step is not None
+        if ok:
+            query("UPDATE api_auth.users SET totp_last_step=%s WHERE id=%s",
+                  params=(step, user_id), auth=True)
     if not ok:
         logging.warning("Failed login for user %r", request.username)
         raise HTTPException(status_code=401, detail="Bad credentials")
-    return TokenResponse(access_token=auth.create_token(request.username))
+    return issue_tokens(user_id, request.username)
+
+
+@app.post("/auth/refresh", tags=["Auth"], response_model=TokenResponse)
+def refresh(request: RefreshRequest):
+    """Get a new access token without password/TOTP. The refresh token is rotated:
+    the used one stops working and a new one is returned."""
+    hashed = auth.token_hash(request.refresh_token)
+    rows = query("SELECT u.id, u.username FROM api_auth.refresh_tokens t "
+                 "JOIN api_auth.users u ON u.id = t.user_id "
+                 "WHERE t.token_hash=%s AND t.expires_at > NOW()", params=(hashed,), auth=True)
+    query("DELETE FROM api_auth.refresh_tokens WHERE token_hash=%s", params=(hashed,), auth=True)
+    if not rows:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+    return issue_tokens(*rows[0])
+
+
+@app.post("/auth/logout", tags=["Auth"], response_model=APIResponse)
+def logout(request: RefreshRequest):
+    """Revoke the refresh token (the access token expires on its own within minutes)."""
+    query("DELETE FROM api_auth.refresh_tokens WHERE token_hash=%s",
+          params=(auth.token_hash(request.refresh_token),), auth=True)
+    return APIResponse(code=200, message="Logged out")
 
 
 @app.post("/auth/totp/setup", tags=["Auth"], response_model=APIResponse)
-def totp_setup(username: CurrentUser):
+def totp_setup(username: SessionUser):
     """Generate a new TOTP secret. Scan `uri` as QR code, then confirm with /auth/totp/enable."""
     secret = pyotp.random_base32()
     uri = pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name="MySQL API")
@@ -174,13 +218,59 @@ def totp_setup(username: CurrentUser):
 
 
 @app.post("/auth/totp/enable", tags=["Auth"], response_model=APIResponse)
-def totp_enable(request: TotpEnableRequest, username: CurrentUser):
+def totp_enable(request: TotpEnableRequest, username: SessionUser):
     """Enable TOTP after proving the authenticator app generates valid codes."""
-    if not auth.verify_totp(request.secret, request.code):
+    step = auth.totp_step(request.secret, request.code)
+    if step is None:
         raise HTTPException(status_code=400, detail="Invalid TOTP code")
-    query("UPDATE api_auth.users SET totp_secret=%s WHERE username=%s",
-          params=(request.secret, username), auth=True)
+    query("UPDATE api_auth.users SET totp_secret=%s, totp_last_step=%s WHERE username=%s",
+          params=(request.secret, step, username), auth=True)
     return APIResponse(code=200, message="TOTP enabled, it is now required at login")
+
+
+@app.delete("/auth/totp", tags=["Auth"], response_model=APIResponse)
+def totp_disable(request: TotpCodeRequest, username: SessionUser):
+    """Disable TOTP, confirmed with a current code from the authenticator app."""
+    secret = query("SELECT totp_secret FROM api_auth.users WHERE username=%s",
+                   params=(username,), auth=True)
+    if not secret or not secret[0] or auth.totp_step(secret[0], request.code) is None:
+        raise HTTPException(status_code=400, detail="TOTP not enabled or invalid code")
+    query("UPDATE api_auth.users SET totp_secret=NULL, totp_last_step=NULL WHERE username=%s",
+          params=(username,), auth=True)
+    return APIResponse(code=200, message="TOTP disabled")
+
+
+@app.post("/auth/api-keys", tags=["Auth"], response_model=APIResponse)
+def create_api_key(request: ApiKeyCreate, username: SessionUser):
+    """Create an API key for scripts (no TOTP needed). The key is shown only once."""
+    key = auth.new_token(auth.API_KEY_PREFIX)
+    query("INSERT INTO api_auth.api_keys (user_id, name, key_hash) "
+          "SELECT id, %s, %s FROM api_auth.users WHERE username=%s",
+          params=(request.name, auth.token_hash(key), username), auth=True)
+    return APIResponse(code=200, message="Store the key now, it won't be shown again",
+                       data={"name": request.name, "key": key})
+
+
+@app.get("/auth/api-keys", tags=["Auth"], response_model=APIResponse)
+def list_api_keys(username: SessionUser):
+    """List your API keys (without the keys themselves)."""
+    rows = query("SELECT k.id, k.name, k.created_at FROM api_auth.api_keys k "
+                 "JOIN api_auth.users u ON u.id = k.user_id WHERE u.username=%s ORDER BY k.id",
+                 params=(username,), auth=True)
+    return APIResponse(code=200, message="API keys",
+                       data=[dict(zip(("id", "name", "created_at"), row)) for row in rows])
+
+
+@app.delete("/auth/api-keys/{key_id}", tags=["Auth"], response_model=APIResponse)
+def delete_api_key(key_id: int, username: SessionUser):
+    """Revoke one of your API keys."""
+    owned = query("SELECT k.id FROM api_auth.api_keys k JOIN api_auth.users u "
+                  "ON u.id = k.user_id WHERE k.id=%s AND u.username=%s",
+                  params=(key_id, username), auth=True)
+    if not owned:
+        raise HTTPException(status_code=404, detail="API key not found")
+    query("DELETE FROM api_auth.api_keys WHERE id=%s", params=(key_id,), auth=True)
+    return APIResponse(code=200, message="API key revoked")
 
 # ------------------- DATABASE ENDPOINTS -------------------
 
@@ -434,7 +524,7 @@ def fetch_user(user_id: int) -> dict:
          tags=["User"],
          response_model=APIResponse,
          summary="List users",
-         dependencies=Protected
+         dependencies=SessionProtected
          )
 def list_users():
     """List all API users."""
@@ -447,7 +537,7 @@ def list_users():
           response_model=APIResponse,
           summary="Create a new user",
           description="Create a new API user. Password is stored as a scrypt hash.",
-          dependencies=Protected
+          dependencies=SessionProtected
           )
 def create_user(user: UserCreate):
     """Create a new user."""
@@ -463,7 +553,7 @@ def create_user(user: UserCreate):
          response_model=APIResponse,
          summary="Get user by ID",
          description="Fetch a user by their unique ID.",
-         dependencies=Protected
+         dependencies=SessionProtected
          )
 def get_user(user_id: int):
     """Get user by ID."""
@@ -475,7 +565,7 @@ def get_user(user_id: int):
          response_model=APIResponse,
          summary="Update user by ID",
          description="Update user email and/or password by their unique ID.",
-         dependencies=Protected
+         dependencies=SessionProtected
          )
 def update_user(user_id: int, user: UserUpdate):
     """Update user by ID."""
@@ -486,6 +576,8 @@ def update_user(user_id: int, user: UserUpdate):
     if user.password is not None:
         query("UPDATE api_auth.users SET password_hash=%s WHERE id=%s",
               params=(auth.hash_password(user.password), user_id), auth=True)
+        # log out everywhere: existing refresh tokens stop working
+        query("DELETE FROM api_auth.refresh_tokens WHERE user_id=%s", params=(user_id,), auth=True)
     return APIResponse(code=200, message="User updated", data=fetch_user(user_id))
 
 
@@ -494,7 +586,7 @@ def update_user(user_id: int, user: UserUpdate):
             response_model=APIResponse,
             summary="Delete user by ID",
             description="Delete a user by their unique ID.",
-            dependencies=Protected
+            dependencies=SessionProtected
             )
 def delete_user(user_id: int):
     """Delete user by ID."""

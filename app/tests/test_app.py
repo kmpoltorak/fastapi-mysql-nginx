@@ -10,7 +10,7 @@ import app as app_module  # noqa: E402
 import auth  # noqa: E402
 
 client = TestClient(app_module.app)  # no `with` -> lifespan (DB bootstrap) doesn't run
-HEADERS = {"Authorization": f"Bearer {auth.create_token('tester')}"}
+HEADERS = {"Authorization": f"Bearer {auth.create_access_token('tester')}"}
 executed = []
 
 
@@ -19,7 +19,7 @@ def fake_query(statement, database_name=None, params=None, auth=False):
     return []
 
 
-app_module.query = fake_query
+app_module.query = auth.query = fake_query
 
 
 def test_health_is_public():
@@ -77,9 +77,19 @@ def test_password_hashing():
 
 def test_totp():
     secret = pyotp.random_base32()
-    assert auth.verify_totp(secret, pyotp.TOTP(secret).now())
-    assert not auth.verify_totp(secret, "abcdef")
-    assert not auth.verify_totp(secret, None)
+    step = auth.totp_step(secret, pyotp.TOTP(secret).now())
+    assert step is not None
+    assert auth.totp_step(secret, pyotp.TOTP(secret).now(), last_step=step) is None  # replay
+    assert auth.totp_step(secret, "abcdef") is None
+    assert auth.totp_step(secret, None) is None
+
+
+def test_api_keys():
+    key = {"Authorization": "Bearer mk_unknown"}
+    assert client.get("/database/get", headers=key).status_code == 401  # not in DB
+    for method, path in (("GET", "/user"), ("POST", "/auth/api-keys"),
+                         ("POST", "/auth/totp/setup")):
+        assert client.request(method, path, headers=key, json={"name": "x"}).status_code == 403
 
 
 def test_alter_table():

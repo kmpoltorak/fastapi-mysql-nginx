@@ -7,6 +7,7 @@ Run: docker compose up -d --build --wait
 import json
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -14,6 +15,7 @@ import pyotp
 import pytest
 
 URL = os.getenv("INTEGRATION_URL")
+HTTP_URL = os.getenv("INTEGRATION_HTTP_URL", (URL or "").replace("https://", "http://"))
 pytestmark = pytest.mark.skipif(not URL, reason="INTEGRATION_URL not set")
 SSL = ssl._create_unverified_context()  # self-signed certificate
 
@@ -31,10 +33,12 @@ def call(method, path, body=None, token=None, url=None):
         return e.code, json.load(e)
 
 
-def login(username, password, totp=None):
+def login(username, password, totp=None, full=False):
     status, body = call("POST", "/login",
                         {"username": username, "password": password, "totp": totp})
-    return body.get("access_token") if status == 200 else status
+    if status != 200:
+        return status
+    return body if full else body["access_token"]
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +52,7 @@ def test_http_redirects_to_https():
             return None
     opener = urllib.request.build_opener(NoRedirect)
     with pytest.raises(urllib.error.HTTPError) as e:
-        opener.open(URL.replace("https://", "http://") + "/health")
+        opener.open(HTTP_URL + "/health")
     assert e.value.code == 301
 
 
@@ -102,6 +106,31 @@ def test_db_user_cannot_touch_system_or_auth_data(token):
     call("DELETE", "/database/delete", {"database_name": "it_sec"}, token)
 
 
+def test_refresh_and_logout():
+    tokens = login(os.getenv("ADMIN_USERNAME", "admin"), os.environ["ADMIN_PASSWORD"], full=True)
+    assert tokens["expires_in"] == 900
+    status, renewed = call("POST", "/auth/refresh", {"refresh_token": tokens["refresh_token"]})
+    assert status == 200 and renewed["refresh_token"] != tokens["refresh_token"]
+    assert call("GET", "/database/get", token=renewed["access_token"])[0] == 200
+    # rotation: a used refresh token can't be used again
+    assert call("POST", "/auth/refresh", {"refresh_token": tokens["refresh_token"]})[0] == 401
+    assert call("POST", "/auth/logout", {"refresh_token": renewed["refresh_token"]})[0] == 200
+    assert call("POST", "/auth/refresh", {"refresh_token": renewed["refresh_token"]})[0] == 401
+
+
+def test_api_keys(token):
+    status, body = call("POST", "/auth/api-keys", {"name": "it-script"}, token)
+    assert status == 200
+    key = body["data"]["key"]
+    assert call("GET", "/database/get", token=key)[0] == 200
+    assert call("GET", "/user", token=key)[0] == 403  # keys can't manage accounts
+    keys = call("GET", "/auth/api-keys", token=token)[1]["data"]
+    key_id = next(k["id"] for k in keys if k["name"] == "it-script")
+    assert "key" not in keys[0]
+    assert call("DELETE", f"/auth/api-keys/{key_id}", token=token)[0] == 200
+    assert call("GET", "/database/get", token=key)[0] == 401
+
+
 def test_users_and_totp(token):
     status, body = call("POST", "/user", {"username": "it_user", "email": "a@b.c",
                                           "password": "pw1"}, token)
@@ -114,11 +143,19 @@ def test_users_and_totp(token):
         secret = call("POST", "/auth/totp/setup", token=user_token)[1]["data"]["secret"]
         assert call("POST", "/auth/totp/enable",
                     {"secret": secret, "code": "abcdef"}, user_token)[0] == 400
+        totp = pyotp.TOTP(secret)
         assert call("POST", "/auth/totp/enable",
-                    {"secret": secret, "code": pyotp.TOTP(secret).now()}, user_token)[0] == 200
+                    {"secret": secret, "code": totp.now()}, user_token)[0] == 200
         assert login("it_user", "pw1") == 401
-        assert isinstance(login("it_user", "pw1", pyotp.TOTP(secret).now()), str)
+        # the enable code is used up; next 30 s code is still accepted (clock drift window)
+        assert login("it_user", "pw1", totp.now()) == 401
+        next_code = totp.at(time.time() + 30)
+        assert isinstance(login("it_user", "pw1", next_code), str)
+        assert login("it_user", "pw1", next_code) == 401  # replay
         assert call("GET", f"/user/{user_id}", token=token)[1]["data"]["totp_enabled"] is True
+        assert call("DELETE", "/auth/totp", {"code": "abcdef"}, user_token)[0] == 400
+        assert call("DELETE", "/auth/totp", {"code": totp.now()}, user_token)[0] == 200
+        assert isinstance(login("it_user", "pw1"), str)
     finally:
         assert call("DELETE", f"/user/{user_id}", token=token)[0] == 200
     assert call("GET", f"/user/{user_id}", token=token)[0] == 404

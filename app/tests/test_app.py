@@ -26,6 +26,21 @@ def test_health_is_public():
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_ready(monkeypatch):
+    assert client.get("/ready").json() == {
+        "status": "ready", "checks": {"database": "ok", "auth_database": "ok"}}
+
+    def auth_db_down(statement, database_name=None, params=None, auth=False):
+        if auth:
+            raise ConnectionError("secret connection details")
+        return []
+    monkeypatch.setattr(app_module, "query", auth_db_down)
+    r = client.get("/ready")
+    assert r.status_code == 503
+    assert r.json()["checks"] == {"database": "ok", "auth_database": "unavailable"}
+    assert "secret" not in r.text
+
+
 def test_token_required():
     assert client.get("/database/get").status_code == 401
     assert client.get("/database/get", headers={"Authorization": "Bearer bad"}).status_code == 401

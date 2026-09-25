@@ -57,6 +57,11 @@ def test_http_redirects_to_https():
     assert e.value.code == 301
 
 
+def test_ready():
+    assert call("GET", "/ready") == (200, {"status": "ready", "checks": {
+        "database": "ok", "auth_database": "ok"}})
+
+
 def test_client_auth(token):
     assert call("POST", "/auth/token", {"client_id": "app", "client_secret": "wrong"})[0] == 401
     assert call("POST", "/auth/token", {"client_id": "nobody", "client_secret": "x"})[0] == 401

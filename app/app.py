@@ -133,7 +133,29 @@ async def mysql_error_handler(request: Request, exc: mysql.connector.Error):
          tags=["API"]
          )
 async def health():
+    """Liveness: the process responds. Doesn't touch MySQL, so a database outage
+    doesn't make the container unhealthy (restarting the app wouldn't fix the DB)."""
     return {"status": "ok"}
+
+
+@app.get("/ready",
+         tags=["API"],
+         responses={503: {"description": "A MySQL connection is unavailable"}}
+         )
+def ready():
+    """Readiness: both MySQL connections (data and auth) answer `SELECT 1`.
+    For monitoring and load balancers; details of errors are only logged."""
+    checks = {}
+    for name, auth_db in (("database", False), ("auth_database", True)):
+        try:
+            query("SELECT 1", auth=auth_db)
+            checks[name] = "ok"
+        except Exception as exc:
+            logging.error("Readiness check %s failed: %s", name, exc)
+            checks[name] = "unavailable"
+    is_ready = all(status == "ok" for status in checks.values())
+    return JSONResponse(status_code=200 if is_ready else 503,
+                        content={"status": "ready" if is_ready else "not ready", "checks": checks})
 
 
 @app.get("/api",

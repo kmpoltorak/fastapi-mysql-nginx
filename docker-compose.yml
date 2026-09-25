@@ -5,7 +5,7 @@ services:
     volumes:
       - simpledb:/var/lib/mysql
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-TestDb890}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-test}
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
@@ -19,7 +19,7 @@ services:
     environment:
       MYSQL_HOST: ${MYSQL_HOST:-db}
       MYSQL_USER: ${MYSQL_USER:-root}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-TestDb890}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-test}
       TZ: ${TZ:-Europe/Warsaw}
       API_KEY: ${API_KEY:-test}
     depends_on:

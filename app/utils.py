@@ -1,34 +1,40 @@
 import os
-import mysql.connector
+from functools import cache
+
+from mysql.connector.pooling import MySQLConnectionPool
 
 
-class SqlOperation:
-    """ MySQl operations """
+@cache
+def get_pool(auth: bool) -> MySQLConnectionPool:
+    """Connection pool for the data user (`api`) or the auth user (`api_auth`).
 
-    def __init__(self, statement: str, database_name: str = None, params: tuple = None):
-        self.statement = statement
-        self.database_name = database_name
-        self.params = params
+    Created lazily, so importing the app doesn't need a running database.
+    """
+    # ponytail: fixed size, get_connection() fails (500) instead of waiting when all are busy
+    return MySQLConnectionPool(
+        pool_name="auth" if auth else "api",
+        pool_size=10,
+        host=os.getenv("MYSQL_HOST", "db"),
+        user="api_auth" if auth else "api",
+        password=os.environ["AUTH_DB_PASSWORD" if auth else "DB_PASSWORD"],
+        autocommit=True
+    )
 
-    def execute(self):
-        """Execute SQL statement on MySQL
 
-        Returns:
-            list: A list of SQL statement results
-        """
-        cnx = mysql.connector.connect(
-            host=os.getenv("MYSQL_HOST"),
-            user=os.getenv("MYSQL_USER"),
-            password=os.getenv("MYSQL_ROOT_PASSWORD"),
-            database=self.database_name,
-            autocommit=True
-        )
-        try:
-            cursor = cnx.cursor()
-            cursor.execute(self.statement, self.params)
-            result = cursor.fetchall()
-        finally:
-            cnx.close()
+def query(statement: str, database_name: str = None, params: tuple = None, auth: bool = False):
+    """Execute SQL statement on MySQL
 
-        # Parsing SQL statement results to have list as output
-        return [row[0] if len(row) == 1 else row for row in result]
+    Returns:
+        list: rows of the result; single-column rows are flattened to values
+    """
+    cnx = get_pool(auth).get_connection()
+    try:
+        if database_name:
+            cnx.cmd_init_db(database_name)  # USE <db>
+        cursor = cnx.cursor()
+        cursor.execute(statement, params)
+        result = cursor.fetchall()
+    finally:
+        cnx.close()  # returns the connection to the pool
+
+    return [row[0] if len(row) == 1 else row for row in result]

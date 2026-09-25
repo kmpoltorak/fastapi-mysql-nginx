@@ -5,60 +5,60 @@ This project is a simple microservice stack for development and learning purpose
 ## Features
 
 - Database management: create, list, delete, backup, restore
-- Table management: create, list, delete, rename, describe columns
-- Row management: insert, get, update, delete
-- User management: create, get, update, delete (in-memory demo)
-- API authentication via token (header: `AccessToken`)
-- Linting (flake8) and tests (pytest), run in GitHub Actions CI
+- Table management: create, list, delete, rename, alter columns (add/modify/drop/rename), describe columns
+- Row management: insert, get (paginated), update, delete (by `id` or any `key_column`)
+- API user management: create, list, get, update, delete (stored in MySQL, scrypt password hashes)
+- Login with username + password (+ optional TOTP 2FA) returning a JWT Bearer token
+- HTTPS in Nginx (self-signed by default), HTTP -> HTTPS redirect, login rate limit
+- Least-privilege MySQL users instead of `root`
+- Linting (flake8), unit and integration tests (pytest), run in GitHub Actions CI
 
 ## Requirements
 
 - Docker
 - Docker Compose
 
-## Environment Variables
+## Configuration
 
-Copy `.env.example` to `.env` and adjust values (Docker Compose reads it automatically; defaults are used when unset):
+Copy `.env.example` to `.env` and set every value; the stack refuses to start with missing secrets. Use alphanumeric values, e.g. `openssl rand -hex 32`.
 
-- `MYSQL_HOST` - MySQL host (default: db)
-- `MYSQL_USER` - MySQL user (default: root)
-- `MYSQL_ROOT_PASSWORD` - MySQL root password
-- `API_KEY` - API authentication token
-- `TZ` - Timezone
+| Variable | Purpose |
+|---|---|
+| `MYSQL_ROOT_PASSWORD` | MySQL root (used only by the `db` container) |
+| `DB_PASSWORD` | MySQL user `api` – data operations |
+| `AUTH_DB_PASSWORD` | MySQL user `api_auth` – API users table only |
+| `JWT_SECRET` | Token signing key (at least 32 characters) |
+| `ADMIN_USERNAME`, `ADMIN_PASSWORD` | First API user, created when the users table is empty |
+| `TZ` | Timezone |
+
+## Security Model
+
+- **MySQL users** (created by [db/init/01-users.sh](db/init/01-users.sh) on first start with an empty volume):
+  - `api` – may create/modify any database, but has no access to `mysql`, `sys` and `api_auth` (MySQL `partial_revokes`), cannot create users or grant privileges.
+  - `api_auth` – only `SELECT/INSERT/UPDATE/DELETE` on `api_auth.users`.
+  - So even arbitrary SQL sent to `/database/restore` cannot read password hashes or create an admin.
+- **Tokens** – JWT (HS256) valid for 30 minutes. Stateless: a deleted user keeps access until the token expires.
+- **Nginx** – TLS 1.2/1.3, port 80 redirects to 443, `/login` limited to 5 requests/min per IP (burst 10, then HTTP 429).
+
+After changing `db/init/` or on an existing volume from a previous version, recreate the database (**deletes all data**):
+
+```
+docker compose down -v && docker compose up -d --build
+```
 
 ## Deployment
 
 Build and start all services:
 
 ```
-docker compose build && docker compose up -d
+docker compose up -d --build
 ```
 
-Rebuild after changes:
+Open https://localhost/ (accept the self-signed certificate warning).
 
-```
-docker compose build && docker compose up -d --force-recreate
-```
+## HTTPS Certificate
 
-## Nginx SSL Setup (optional)
-
-1. Edit `nginx/fastapi.conf` for SSL configuration
-2. Add your certificate and key to the `nginx/` directory
-3. Add to `nginx/Dockerfile`:
-   ```
-   COPY certificate* /etc/ssl/
-   ```
-4. Expose port 443 in the `proxy` service in `docker-compose.yml`
-5. (Optional) Add HTTP->HTTPS redirect in `nginx/fastapi.conf`:
-   ```
-   server {
-       listen 80;
-       server_name _;
-       return 301 https://$host$request_uri;
-   }
-   ```
-
-**Note:** Remove passphrase from your certificate key if present (see OpenSSL docs).
+On first start Nginx generates a self-signed certificate into `nginx/certs/` (git-ignored). To use your own, put `cert.pem` and `key.pem` (without passphrase) there and restart the `proxy` service.
 
 ## Example: Running Containers
 
@@ -68,12 +68,36 @@ $ docker ps
 CONTAINER ID   IMAGE                       COMMAND                  ...
 ...           fastapi-mysql-nginx_proxy   ...
 ...           fastapi-mysql-nginx_app     ...
-...           mysql:8.3                   ...
+...           mysql:8.4                   ...
 ```
 
 ## API Usage
 
-You can use the FastAPI Swagger UI (available at `/`) or tools like curl/Postman. All endpoints except `/health` require the `AccessToken` header with the value set to your `API_KEY`.
+You can use the FastAPI Swagger UI (available at `/`) or tools like curl/Postman. All endpoints except `/health`, `/api` and `/login` require a Bearer token.
+
+### Login
+
+```
+curl -k -X POST https://localhost/login -H 'Content-Type: application/json' \
+  -d '{"username": "admin", "password": "<ADMIN_PASSWORD>"}'
+# {"access_token": "eyJ...", "token_type": "bearer"}
+
+curl -k https://localhost/database/get -H 'Authorization: Bearer eyJ...'
+```
+
+In Swagger: call `/login`, click **Authorize** and paste the `access_token`.
+
+### TOTP (two-factor authentication)
+
+1. `POST /auth/totp/setup` – returns `secret` and an `otpauth://` `uri` (turn it into a QR code or type the secret into Google Authenticator, Aegis, 1Password...).
+2. `POST /auth/totp/enable` with `{"secret": "...", "code": "123456"}` – confirms the app works and turns TOTP on.
+3. From now on `/login` requires `"totp": "123456"`.
+
+Lost the authenticator? Reset it as MySQL root: `UPDATE api_auth.users SET totp_secret = NULL WHERE username = '...';`
+
+### Errors
+
+Errors use HTTP status codes with `{"detail": "..."}`: `400` statement rejected by MySQL (bad SQL, missing table, duplicate...), `401` missing/invalid token or bad credentials, `404` user not found, `422` invalid input (e.g. identifier with forbidden characters), `429` too many login attempts, `500` server/connection error.
 
 ### Example: Create Table
 
@@ -103,6 +127,25 @@ mysql> show columns from person;
 +---------+--------------+------+-----+---------+----------------+
 ```
 
+### Alter Table
+
+```
+PUT /table/alter
+{ "database_name": "test", "table_name": "person", "action": "add", "column_name": "age", "params": "INT DEFAULT 0" }
+```
+
+`action`: `add` / `modify` (need `params`), `drop`, `rename` (needs `new_column_name`).
+
+### Rows
+
+```
+GET /row/get/test/person?limit=100&offset=0          # limit 1–1000, default 100
+
+PUT /row/update
+{ "database_name": "test", "table_name": "person", "row_id": 1, "values": {"name": "Ann"} }
+# optional "key_column": "person_id" (default "id"), same for DELETE /row/delete
+```
+
 ### Database Backup & Restore
 
 **Backup:**
@@ -127,10 +170,18 @@ POST /database/restore
 
 ## Linting & Tests
 
-Tests mock the database, so no MySQL is needed:
+Unit tests mock the database:
 
 ```
 pip install -r app/requirements.txt flake8 pytest httpx
 flake8 app
-cd app && python -m pytest
+cd app && python -m pytest tests/test_app.py
+```
+
+Integration tests run against the whole running stack over HTTPS:
+
+```
+docker compose up -d --build --wait
+set -a; . ./.env; set +a
+cd app && INTEGRATION_URL=https://localhost python -m pytest tests/test_integration.py
 ```

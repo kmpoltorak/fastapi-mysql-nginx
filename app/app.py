@@ -1,17 +1,22 @@
 import logging
 import subprocess
 import os
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import FastAPI, Depends, Path
+import mysql.connector
+import pyotp
+from fastapi import FastAPI, Depends, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 
 import auth
-from utils import SqlOperation
+from utils import query
 from model import (
     APIResponse,
     DatabaseRequest,
+    TableAlterRequest,
     TableCreateRequest,
     TableRenameRequest,
     TableRequest,
@@ -20,17 +25,27 @@ from model import (
     RowDeleteRequest,
     DatabaseBackupRequest,
     DatabaseRestoreRequest,
+    LoginRequest,
+    TokenResponse,
+    TotpEnableRequest,
     UserCreate,
     UserUpdate
 )
 
 Identifier = Annotated[str, Path(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
+CurrentUser = Annotated[str, Depends(auth.get_current_user)]
+Protected = [Depends(auth.get_current_user)]
 
 # Request tags
 tags_metadata = [
     {
         "name": "API",
         "description": "General API endpoints including health and version."
+    },
+    {
+        "name": "Auth",
+        "description": """Log in with `/login`, then click **Authorize** and paste
+        the `access_token`. Optional TOTP two-factor authentication."""
     },
     {
         "name": "Database",
@@ -40,30 +55,47 @@ tags_metadata = [
     {
         "name": "Table",
         "description": """Endpoints for table management:
-        create, delete, rename, list tables, and row/column operations."""
+        create, delete, rename, alter columns, list tables, and describe columns."""
+    },
+    {
+        "name": "Row",
+        "description": "Endpoints for row operations: insert, get (paginated), update, delete."
     },
     {
         "name": "User",
-        "description": "Endpoints for user management: create, update, delete, and fetch users."
+        "description": "Endpoints for API user management: create, update, delete, and fetch users."
     }
 ]
 
-__version__ = "1.3.0"
+__version__ = "2.0.0"
 
-# Initiate FastAPI with vault API key authentication by "AccessToken" in request header
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create the first admin user from env when the users table is empty."""
+    if not query("SELECT COUNT(*) FROM api_auth.users", auth=True)[0]:
+        query("INSERT INTO api_auth.users (username, email, password_hash) VALUES (%s, %s, %s)",
+              params=(os.getenv("ADMIN_USERNAME", "admin"), "",
+                      auth.hash_password(os.environ["ADMIN_PASSWORD"])),
+              auth=True)
+        logging.info("Created initial admin user")
+    yield
+
+
 app = FastAPI(
     title="MySQL API",
     version=__version__,
     openapi_tags=tags_metadata,
     redoc_url=None,
     docs_url="/",
+    lifespan=lifespan,
 )
 
 origins = [
     "http://127.0.0.1",
     "http://localhost",
-    "http://127.0.0.1:8080",
-    "http://localhost:8080"
+    "https://127.0.0.1",
+    "https://localhost"
 ]
 
 app.add_middleware(
@@ -80,6 +112,16 @@ logging.basicConfig(filename="debug.log",
                     format="%(asctime)s [%(levelname)s] %(message)s",
                     level=logging.INFO
                     )
+
+
+@app.exception_handler(mysql.connector.Error)
+async def mysql_error_handler(request: Request, exc: mysql.connector.Error):
+    """Statement rejected by the server (bad SQL, missing table, duplicate...) -> 400.
+
+    No SQLSTATE (connector/pool errors), connection (08) or app login (28) errors -> 500.
+    """
+    status = 400 if exc.sqlstate and not exc.sqlstate.startswith(("08", "28")) else 500
+    return JSONResponse(status_code=status, content={"detail": str(exc)})
 
 # ------------------- API ENDPOINTS -------------------
 
@@ -104,6 +146,42 @@ async def api():
     """
     return APIResponse(code=200, message=f"MySQL API version {__version__}")
 
+# ------------------- AUTH ENDPOINTS -------------------
+
+
+@app.post("/login", tags=["Auth"], response_model=TokenResponse)
+def login(request: LoginRequest):
+    """Exchange username, password (and TOTP code if enabled) for a Bearer token."""
+    rows = query("SELECT password_hash, totp_secret FROM api_auth.users WHERE username=%s",
+                 params=(request.username,), auth=True)
+    password_hash, totp_secret = rows[0] if rows else (auth.DUMMY_HASH, None)
+    ok = auth.verify_password(request.password, password_hash) and bool(rows)
+    if ok and totp_secret:
+        ok = auth.verify_totp(totp_secret, request.totp)
+    if not ok:
+        logging.warning("Failed login for user %r", request.username)
+        raise HTTPException(status_code=401, detail="Bad credentials")
+    return TokenResponse(access_token=auth.create_token(request.username))
+
+
+@app.post("/auth/totp/setup", tags=["Auth"], response_model=APIResponse)
+def totp_setup(username: CurrentUser):
+    """Generate a new TOTP secret. Scan `uri` as QR code, then confirm with /auth/totp/enable."""
+    secret = pyotp.random_base32()
+    uri = pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name="MySQL API")
+    return APIResponse(code=200, message="Scan the URI and confirm with a code",
+                       data={"secret": secret, "uri": uri})
+
+
+@app.post("/auth/totp/enable", tags=["Auth"], response_model=APIResponse)
+def totp_enable(request: TotpEnableRequest, username: CurrentUser):
+    """Enable TOTP after proving the authenticator app generates valid codes."""
+    if not auth.verify_totp(request.secret, request.code):
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+    query("UPDATE api_auth.users SET totp_secret=%s WHERE username=%s",
+          params=(request.secret, username), auth=True)
+    return APIResponse(code=200, message="TOTP enabled, it is now required at login")
+
 # ------------------- DATABASE ENDPOINTS -------------------
 
 
@@ -111,7 +189,7 @@ async def api():
          tags=["Database"],
          name="",
          response_model=APIResponse,
-         dependencies=[Depends(auth.get_api_key)]
+         dependencies=Protected
          )
 def get_db():
     """Return existing databases list
@@ -119,16 +197,11 @@ def get_db():
     Returns:
         APIResponse: code and message about statement status
     """
-    try:
-        sql = SqlOperation("SHOW DATABASES")
-        result = sql.execute()
-        return APIResponse(code=200, message="Existing databases", data=result)
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    return APIResponse(code=200, message="Existing databases", data=query("SHOW DATABASES"))
 
 
 @app.post("/database/create", tags=["Database"], name="",
-          response_model=APIResponse, dependencies=[Depends(auth.get_api_key)])
+          response_model=APIResponse, dependencies=Protected)
 def create_db(request: DatabaseRequest):
     """Create new database
 
@@ -139,20 +212,15 @@ def create_db(request: DatabaseRequest):
     Returns:
         APIResponse: code and message about statement status
     """
-    try:
-        database_name = request.database_name
-        sql = SqlOperation(f"CREATE DATABASE {database_name}")
-        sql.execute()
-        return APIResponse(code=200, message=f"Database {database_name} has been created")
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    query(f"CREATE DATABASE {request.database_name}")
+    return APIResponse(code=200, message=f"Database {request.database_name} has been created")
 
 
 @app.delete("/database/delete",
             tags=["Database"],
             name="",
             response_model=APIResponse,
-            dependencies=[Depends(auth.get_api_key)]
+            dependencies=Protected
             )
 def delete_db(request: DatabaseRequest):
     """Delete existing database
@@ -164,13 +232,8 @@ def delete_db(request: DatabaseRequest):
     Returns:
         APIResponse: code and message about statement status
     """
-    try:
-        database_name = request.database_name
-        sql = SqlOperation(f"DROP DATABASE {database_name}")
-        sql.execute()
-        return APIResponse(code=200, message=f"Database {database_name} has been deleted")
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    query(f"DROP DATABASE {request.database_name}")
+    return APIResponse(code=200, message=f"Database {request.database_name} has been deleted")
 
 # ------------------- TABLE ENDPOINTS -------------------
 
@@ -179,7 +242,7 @@ def delete_db(request: DatabaseRequest):
          tags=["Table"],
          name="",
          response_model=APIResponse,
-         dependencies=[Depends(auth.get_api_key)]
+         dependencies=Protected
          )
 def get_table(database_name: Identifier):
     """Show existing tables in provided database
@@ -190,20 +253,15 @@ def get_table(database_name: Identifier):
     Returns:
         APIResponse: code and message about statement status
     """
-    try:
-        sql = SqlOperation("SHOW TABLES", database_name)
-        result = sql.execute()
-        return APIResponse(
-            code=200, message=f'Existing tables in database {database_name}', data=result)
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    return APIResponse(code=200, message=f'Existing tables in database {database_name}',
+                       data=query("SHOW TABLES", database_name))
 
 
 @app.post("/table/create",
           tags=["Table"],
           name="",
           response_model=APIResponse,
-          dependencies=[Depends(auth.get_api_key)]
+          dependencies=Protected
           )
 def create_table(request: TableCreateRequest):
     """Create table with columns that have constraints
@@ -216,24 +274,17 @@ def create_table(request: TableCreateRequest):
     Returns:
         APIResponse: code and message about statement status
     """
-    try:
-        database_name = request.database_name
-        table_name = request.table_name
-        columns = request.columns
-        columns = ",".join([f"{column.name} {column.params}" for column in columns])
-        sql = SqlOperation(f"CREATE TABLE {table_name} ({columns})", database_name)
-        sql.execute()
-        return APIResponse(
-            code=200, message=f'Table {table_name} in database {database_name} has been created')
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    columns = ",".join([f"{column.name} {column.params}" for column in request.columns])
+    query(f"CREATE TABLE {request.table_name} ({columns})", request.database_name)
+    return APIResponse(code=200, message=f'Table {request.table_name} in database '
+                                         f'{request.database_name} has been created')
 
 
 @app.put("/table/rename",
          tags=["Table"],
          name="",
          response_model=APIResponse,
-         dependencies=[Depends(auth.get_api_key)]
+         dependencies=Protected
          )
 def rename_table(request: TableRenameRequest):
     """Rename existing table name to new one
@@ -247,26 +298,38 @@ def rename_table(request: TableRenameRequest):
     Returns:
         APIResponse: Code and message about statement status
     """
-    try:
-        database_name = request.database_name
-        old_table_name = request.old_table_name
-        new_table_name = request.new_table_name
-        sql = SqlOperation(f"RENAME TABLE {old_table_name} TO {new_table_name}", database_name)
-        sql.execute()
-        return APIResponse(
-            code=200,
-            message=f"Table {old_table_name} has been renamed to "
-                    f"{new_table_name} in database {database_name}"
-        )
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    query(f"RENAME TABLE {request.old_table_name} TO {request.new_table_name}",
+          request.database_name)
+    return APIResponse(
+        code=200,
+        message=f"Table {request.old_table_name} has been renamed to "
+                f"{request.new_table_name} in database {request.database_name}"
+    )
+
+
+@app.put("/table/alter",
+         tags=["Table"],
+         response_model=APIResponse,
+         dependencies=Protected
+         )
+def alter_table(request: TableAlterRequest):
+    """Add, modify, drop or rename a column (ALTER TABLE)"""
+    column = request.column_name
+    clause = {
+        "add": f"ADD COLUMN {column} {request.params}",
+        "modify": f"MODIFY COLUMN {column} {request.params}",
+        "drop": f"DROP COLUMN {column}",
+        "rename": f"RENAME COLUMN {column} TO {request.new_column_name}",
+    }[request.action]
+    query(f"ALTER TABLE {request.table_name} {clause}", request.database_name)
+    return APIResponse(code=200, message=f"Table {request.table_name} altered: {clause}")
 
 
 @app.delete("/table/delete",
             tags=["Table"],
             name="",
             response_model=APIResponse,
-            dependencies=[Depends(auth.get_api_key)]
+            dependencies=Protected
             )
 def delete_table(request: TableRequest):
     """Delete table if exist
@@ -279,134 +342,120 @@ def delete_table(request: TableRequest):
     Returns:
         APIResponse: Code and message about statement status
     """
-    try:
-        database_name = request.database_name
-        table_name = request.table_name
-        sql = SqlOperation(f"DROP TABLE {table_name}", database_name)
-        sql.execute()
-        return APIResponse(
-            code=200, message=f'Table {table_name} has been deleted from database {database_name}')
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    query(f"DROP TABLE {request.table_name}", request.database_name)
+    return APIResponse(code=200, message=f'Table {request.table_name} has been deleted '
+                                         f'from database {request.database_name}')
 
 
 @app.get("/table/columns/{database_name}/{table_name}",
          tags=["Table"],
          response_model=APIResponse,
-         dependencies=[Depends(auth.get_api_key)]
+         dependencies=Protected
          )
 def get_table_columns(database_name: Identifier, table_name: Identifier):
     """Get columns for a given table (DESCRIBE table)."""
-    try:
-        sql = SqlOperation(f"DESCRIBE {table_name}", database_name)
-        result = sql.execute()
-        return APIResponse(code=200, message=f'Columns for table {table_name}', data=result)
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    return APIResponse(code=200, message=f'Columns for table {table_name}',
+                       data=query(f"DESCRIBE {table_name}", database_name))
 
 # ------------------- ROW CRUD ENDPOINTS -------------------
 
 
 @app.post("/row/insert",
-          tags=["Table"],
+          tags=["Row"],
           response_model=APIResponse,
-          dependencies=[Depends(auth.get_api_key)]
+          dependencies=Protected
           )
 def insert_row(request: RowInsertRequest):
     """Insert a new record into a table"""
-    try:
-        columns = ', '.join(request.values.keys())
-        placeholders = ', '.join(['%s'] * len(request.values))
-        values = tuple(request.values.values())
-        sql = SqlOperation(
-            f"INSERT INTO {request.table_name} ({columns}) VALUES ({placeholders})",
-            request.database_name,
-            params=values
-        )
-        sql.execute()
-        return APIResponse(code=200, message='Row inserted')
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    columns = ', '.join(request.values.keys())
+    placeholders = ', '.join(['%s'] * len(request.values))
+    query(f"INSERT INTO {request.table_name} ({columns}) VALUES ({placeholders})",
+          request.database_name, params=tuple(request.values.values()))
+    return APIResponse(code=200, message='Row inserted')
 
 
 @app.get("/row/get/{database_name}/{table_name}",
-         tags=["Table"],
+         tags=["Row"],
          response_model=APIResponse,
-         dependencies=[Depends(auth.get_api_key)]
+         dependencies=Protected
          )
-def get_rows(database_name: Identifier, table_name: Identifier):
-    """Get all records from a table"""
-    try:
-        sql = SqlOperation(f"SELECT * FROM {table_name}", database_name)
-        result = sql.execute()
-        return APIResponse(code=200, message='Rows fetched', data=result)
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+def get_rows(database_name: Identifier, table_name: Identifier,
+             limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+             offset: Annotated[int, Query(ge=0)] = 0):
+    """Get records from a table, paginated with limit/offset"""
+    result = query(f"SELECT * FROM {table_name} LIMIT %s OFFSET %s", database_name,
+                   params=(limit, offset))
+    return APIResponse(code=200, message='Rows fetched', data=result)
 
 
 @app.put("/row/update",
-         tags=["Table"],
+         tags=["Row"],
          response_model=APIResponse,
-         dependencies=[Depends(auth.get_api_key)]
+         dependencies=Protected
          )
 def update_row(request: RowUpdateRequest):
-    """Update a record in a table by id"""
-    try:
-        set_clause = ', '.join([f"{k}=%s" for k in request.values.keys()])
-        values = tuple(request.values.values()) + (request.row_id,)
-        sql = SqlOperation(
-            f"UPDATE {request.table_name} SET {set_clause} WHERE id=%s",
-            request.database_name,
-            params=values
-        )
-        sql.execute()
-        return APIResponse(code=200, message='Row updated')
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    """Update a record in a table by its key column (default: id)"""
+    set_clause = ', '.join([f"{k}=%s" for k in request.values.keys()])
+    query(f"UPDATE {request.table_name} SET {set_clause} WHERE {request.key_column}=%s",
+          request.database_name, params=tuple(request.values.values()) + (request.row_id,))
+    return APIResponse(code=200, message='Row updated')
 
 
 @app.delete("/row/delete",
-            tags=["Table"],
+            tags=["Row"],
             response_model=APIResponse,
-            dependencies=[Depends(auth.get_api_key)]
+            dependencies=Protected
             )
 def delete_row(request: RowDeleteRequest):
-    """Delete a record from a table by id"""
-    try:
-        sql = SqlOperation(
-            f"DELETE FROM {request.table_name} WHERE id=%s",
-            request.database_name,
-            params=(request.row_id,)
-        )
-        sql.execute()
-        return APIResponse(code=200, message='Row deleted')
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    """Delete a record from a table by its key column (default: id)"""
+    query(f"DELETE FROM {request.table_name} WHERE {request.key_column}=%s",
+          request.database_name, params=(request.row_id,))
+    return APIResponse(code=200, message='Row deleted')
 
 # ------------------- USER MANAGEMENT ENDPOINTS -------------------
 
 
-# In-memory user store for demonstration (replace with DB in production)
-users = {}
-user_id_counter = 1
+USER_COLUMNS = "id, username, email, totp_secret IS NOT NULL"
+
+
+def user_dict(row) -> dict:
+    return dict(zip(("id", "username", "email", "totp_enabled"), row[:3] + (bool(row[3]),)))
+
+
+def fetch_user(user_id: int) -> dict:
+    rows = query(f"SELECT {USER_COLUMNS} FROM api_auth.users WHERE id=%s",
+                 params=(user_id,), auth=True)
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user_dict(rows[0])
+
+
+@app.get("/user",
+         tags=["User"],
+         response_model=APIResponse,
+         summary="List users",
+         dependencies=Protected
+         )
+def list_users():
+    """List all API users."""
+    rows = query(f"SELECT {USER_COLUMNS} FROM api_auth.users ORDER BY id", auth=True)
+    return APIResponse(code=200, message="Users fetched", data=[user_dict(r) for r in rows])
 
 
 @app.post("/user",
           tags=["User"],
           response_model=APIResponse,
           summary="Create a new user",
-          description="Create a new user. Password is not stored (demo only).",
-          dependencies=[Depends(auth.get_api_key)]
+          description="Create a new API user. Password is stored as a scrypt hash.",
+          dependencies=Protected
           )
-async def create_user(user: UserCreate):
+def create_user(user: UserCreate):
     """Create a new user."""
-    global user_id_counter
-    user_data = user.model_dump()
-    user_data.pop("password")  # Do not store password in plain text (for demo only)
-    user_data["id"] = user_id_counter
-    users[user_id_counter] = user_data
-    user_id_counter += 1
-    return APIResponse(code=200, message="User created", data=user_data)
+    query("INSERT INTO api_auth.users (username, email, password_hash) VALUES (%s, %s, %s)",
+          params=(user.username, user.email, auth.hash_password(user.password)), auth=True)
+    user_id = query("SELECT id FROM api_auth.users WHERE username=%s",
+                    params=(user.username,), auth=True)[0]
+    return APIResponse(code=200, message="User created", data=fetch_user(user_id))
 
 
 @app.get("/user/{user_id}",
@@ -414,31 +463,30 @@ async def create_user(user: UserCreate):
          response_model=APIResponse,
          summary="Get user by ID",
          description="Fetch a user by their unique ID.",
-         dependencies=[Depends(auth.get_api_key)]
+         dependencies=Protected
          )
-async def get_user(user_id: int):
+def get_user(user_id: int):
     """Get user by ID."""
-    user = users.get(user_id)
-    if not user:
-        return APIResponse(code=404, message="User not found")
-    return APIResponse(code=200, message="User fetched", data=user)
+    return APIResponse(code=200, message="User fetched", data=fetch_user(user_id))
 
 
 @app.put("/user/{user_id}",
          tags=["User"],
          response_model=APIResponse,
          summary="Update user by ID",
-         description="Update user details by their unique ID.",
-         dependencies=[Depends(auth.get_api_key)]
+         description="Update user email and/or password by their unique ID.",
+         dependencies=Protected
          )
-async def update_user(user_id: int, user: UserUpdate):
+def update_user(user_id: int, user: UserUpdate):
     """Update user by ID."""
-    if user_id not in users:
-        return APIResponse(code=404, message="User not found")
-    update_data = user.model_dump(exclude_unset=True)
-    update_data.pop("password", None)  # Not stored (demo only)
-    users[user_id].update(update_data)
-    return APIResponse(code=200, message="User updated", data=users[user_id])
+    fetch_user(user_id)
+    if user.email is not None:
+        query("UPDATE api_auth.users SET email=%s WHERE id=%s",
+              params=(user.email, user_id), auth=True)
+    if user.password is not None:
+        query("UPDATE api_auth.users SET password_hash=%s WHERE id=%s",
+              params=(auth.hash_password(user.password), user_id), auth=True)
+    return APIResponse(code=200, message="User updated", data=fetch_user(user_id))
 
 
 @app.delete("/user/{user_id}",
@@ -446,60 +494,55 @@ async def update_user(user_id: int, user: UserUpdate):
             response_model=APIResponse,
             summary="Delete user by ID",
             description="Delete a user by their unique ID.",
-            dependencies=[Depends(auth.get_api_key)]
+            dependencies=Protected
             )
-async def delete_user(user_id: int):
+def delete_user(user_id: int):
     """Delete user by ID."""
-    if user_id not in users:
-        return APIResponse(code=404, message="User not found")
-    users.pop(user_id)
+    fetch_user(user_id)
+    query("DELETE FROM api_auth.users WHERE id=%s", params=(user_id,), auth=True)
     return APIResponse(code=200, message="User deleted")
 
 # ------------------- DATABASE BACKUP AND RESTORE ENDPOINTS -------------------
 
 
-def run_mysql_tool(tool: str, database_name: str, stdin: str = None):
-    """Run mysql/mysqldump against the configured server; password is passed via env."""
+def run_mysql_tool(tool: str, database_name: str, *args: str, stdin: str = None):
+    """Run mysql/mysqldump as the `api` user; password is passed via env."""
     cmd = [
         tool,
         f"-h{os.getenv('MYSQL_HOST', 'db')}",
-        f"-u{os.getenv('MYSQL_USER', 'root')}",
+        "-uapi",
         "--ssl-verify-server-cert=OFF",
+        *args,
         database_name
     ]
-    env = {**os.environ, "MYSQL_PWD": os.getenv("MYSQL_ROOT_PASSWORD", "")}
+    env = {**os.environ, "MYSQL_PWD": os.environ["DB_PASSWORD"]}
     return subprocess.run(cmd, input=stdin, capture_output=True, text=True, env=env)
 
 
 @app.post("/database/backup",
           tags=["Database"],
           response_model=APIResponse,
-          dependencies=[Depends(auth.get_api_key)]
+          dependencies=Protected
           )
 def backup_database(request: DatabaseBackupRequest):
     """Backup a database and return SQL dump as string."""
-    try:
-        result = run_mysql_tool("mysqldump", request.database_name)
-        if result.returncode != 0:
-            return APIResponse(code=500, message=f"mysqldump error: {result.stderr}")
-        return APIResponse(code=200, message="Backup successful", data=result.stdout)
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    # --no-tablespaces: tablespace info needs the global PROCESS privilege
+    result = run_mysql_tool("mysqldump", request.database_name, "--no-tablespaces")
+    if result.returncode != 0:
+        raise HTTPException(status_code=400, detail=f"mysqldump error: {result.stderr}")
+    return APIResponse(code=200, message="Backup successful", data=result.stdout)
 
 
 @app.post("/database/restore",
           tags=["Database"],
           response_model=APIResponse,
-          dependencies=[Depends(auth.get_api_key)]
+          dependencies=Protected
           )
 def restore_database(request: DatabaseRestoreRequest):
     """Restore a database from SQL dump string."""
-    try:
-        if not request.sql_dump.strip():
-            return APIResponse(code=400, message="SQL dump is empty")
-        result = run_mysql_tool("mysql", request.database_name, stdin=request.sql_dump)
-        if result.returncode != 0:
-            return APIResponse(code=500, message=f"mysql error: {result.stderr}")
-        return APIResponse(code=200, message="Restore successful")
-    except Exception as exc:
-        return APIResponse(code=500, message=str(exc))
+    if not request.sql_dump.strip():
+        raise HTTPException(status_code=400, detail="SQL dump is empty")
+    result = run_mysql_tool("mysql", request.database_name, stdin=request.sql_dump)
+    if result.returncode != 0:
+        raise HTTPException(status_code=400, detail=f"mysql error: {result.stderr}")
+    return APIResponse(code=200, message="Restore successful")

@@ -1,36 +1,41 @@
 import os
 
-os.environ["API_KEY"] = "test"
+os.environ["JWT_SECRET"] = "unit-test-secret-at-least-32-bytes-long"
 
+import jwt  # noqa: E402
+import pyotp  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import app as app_module  # noqa: E402
+import auth  # noqa: E402
 
-client = TestClient(app_module.app)
-HEADERS = {"AccessToken": "test"}
+client = TestClient(app_module.app)  # no `with` -> lifespan (DB bootstrap) doesn't run
+HEADERS = {"Authorization": f"Bearer {auth.create_token('tester')}"}
 executed = []
 
 
-class FakeSql:
-    def __init__(self, statement, database_name=None, params=None):
-        self.call = (statement, database_name, params)
-
-    def execute(self):
-        executed.append(self.call)
-        return []
+def fake_query(statement, database_name=None, params=None, auth=False):
+    executed.append((statement, database_name, params))
+    return []
 
 
-app_module.SqlOperation = FakeSql
+app_module.query = fake_query
 
 
 def test_health_is_public():
     assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_auth_required():
-    assert client.get("/database/get").status_code == 403
-    assert client.get("/database/get", headers={"AccessToken": "bad"}).status_code == 403
-    assert client.get("/database/get", headers=HEADERS).json()["code"] == 200
+def test_token_required():
+    assert client.get("/database/get").status_code == 401
+    assert client.get("/database/get", headers={"Authorization": "Bearer bad"}).status_code == 401
+    expired = jwt.encode({"sub": "x", "exp": 0}, os.environ["JWT_SECRET"], "HS256")
+    assert client.get("/database/get",
+                      headers={"Authorization": f"Bearer {expired}"}).status_code == 401
+    forged = jwt.encode({"sub": "x"}, "another-secret-at-least-32-bytes-long", "HS256")
+    assert client.get("/database/get",
+                      headers={"Authorization": f"Bearer {forged}"}).status_code == 401
+    assert client.get("/database/get", headers=HEADERS).status_code == 200
 
 
 def test_identifiers_are_validated():
@@ -43,22 +48,49 @@ def test_identifiers_are_validated():
     assert client.post("/row/insert", headers=HEADERS, json={
         "database_name": "db", "table_name": "t", "values": {}
     }).status_code == 422
+    assert client.request("DELETE", "/row/delete", headers=HEADERS, json={
+        "database_name": "db", "table_name": "t", "row_id": 1, "key_column": "id OR 1=1"
+    }).status_code == 422
 
 
-def test_row_update_uses_params():
+def test_row_queries_use_params():
     executed.clear()
-    r = client.put("/row/update", headers=HEADERS, json={
-        "database_name": "db", "table_name": "t", "row_id": 7, "values": {"name": "x'y"}
+    client.put("/row/update", headers=HEADERS, json={
+        "database_name": "db", "table_name": "t", "row_id": 7, "values": {"name": "x'y"},
+        "key_column": "uid"
     })
-    assert r.json()["code"] == 200
-    assert executed == [("UPDATE t SET name=%s WHERE id=%s", "db", ("x'y", 7))]
+    client.get("/row/get/db/t?limit=5&offset=10", headers=HEADERS)
+    assert executed == [
+        ("UPDATE t SET name=%s WHERE uid=%s", "db", ("x'y", 7)),
+        ("SELECT * FROM t LIMIT %s OFFSET %s", "db", (5, 10)),
+    ]
+    assert client.get("/row/get/db/t?limit=5000", headers=HEADERS).status_code == 422
 
 
-def test_user_password_never_stored():
-    uid = client.post("/user", headers=HEADERS, json={
-        "username": "a", "email": "a@b.c", "password": "p"
-    }).json()["data"]["id"]
-    r = client.put(f"/user/{uid}", headers=HEADERS, json={"password": "new"})
-    assert "password" not in r.json()["data"]
-    assert client.delete(f"/user/{uid}", headers=HEADERS).json()["code"] == 200
-    assert client.get(f"/user/{uid}", headers=HEADERS).json()["code"] == 404
+def test_password_hashing():
+    stored = auth.hash_password("secret")
+    assert stored.startswith("scrypt$") and "secret" not in stored
+    assert auth.verify_password("secret", stored)
+    assert not auth.verify_password("Secret", stored)
+    assert stored != auth.hash_password("secret")  # random salt
+
+
+def test_totp():
+    secret = pyotp.random_base32()
+    assert auth.verify_totp(secret, pyotp.TOTP(secret).now())
+    assert not auth.verify_totp(secret, "abcdef")
+    assert not auth.verify_totp(secret, None)
+
+
+def test_alter_table():
+    executed.clear()
+    base = {"database_name": "db", "table_name": "t", "column_name": "age"}
+    for body in ({"action": "add", "params": "INT"}, {"action": "modify", "params": "BIGINT"},
+                 {"action": "rename", "new_column_name": "years"}, {"action": "drop"}):
+        assert client.put("/table/alter", headers=HEADERS, json={**base, **body}).status_code == 200
+    assert [sql for sql, *_ in executed] == [
+        "ALTER TABLE t ADD COLUMN age INT", "ALTER TABLE t MODIFY COLUMN age BIGINT",
+        "ALTER TABLE t RENAME COLUMN age TO years", "ALTER TABLE t DROP COLUMN age"]
+    for bad in ({"action": "add"}, {"action": "rename"}, {"action": "truncate"},
+                {"action": "rename", "new_column_name": "x;--"}):
+        assert client.put("/table/alter", headers=HEADERS, json={**base, **bad}).status_code == 422

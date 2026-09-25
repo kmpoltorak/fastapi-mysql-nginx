@@ -88,7 +88,16 @@ CONTAINER ID   IMAGE                       COMMAND                  ...
 
 ## API Usage
 
-You can use the FastAPI Swagger UI (available at `/`) or tools like curl/Postman. All endpoints except `/health`, `/api` and `/auth/token` require a client Bearer token.
+You can use the FastAPI Swagger UI (available at `/`) or tools like curl/Postman. All endpoints except `/health`, `/ready`, `/api` and `/auth/token` require a client Bearer token.
+
+### Health and readiness
+
+| Endpoint | Checks | Use |
+|---|---|---|
+| `GET /health` | process responds (no DB) | container healthcheck; always `200` while the app runs |
+| `GET /ready` | `SELECT 1` on both MySQL connections | monitoring / load balancer; `200` or `503` with `{"checks": {"database": "ok", "auth_database": "unavailable"}}` |
+
+`/health` deliberately ignores MySQL: during a database outage restarting the app wouldn't help. Both are public and don't reveal error details (they are logged).
 
 ### API client token
 

@@ -49,9 +49,10 @@ Copy `.env.example` to `.env` and set every value; the stack refuses to start wi
   - `api` – may create/modify any database, but has no access to `mysql`, `sys` and `api_auth` (MySQL `partial_revokes`), cannot create users or grant privileges.
   - `api_auth` – only `SELECT/INSERT/UPDATE/DELETE` on `api_auth` tables (`clients`, `users`), no DDL.
   - So even arbitrary SQL sent to `/database/restore` cannot read password hashes or create a client.
+- **Restore sandbox** – the dump is fed to the MariaDB `mysql` client with `--sandbox` (rejects `\!`/`system`, `source`, `tee`, `pager`... – no shell or file access) and `--local-infile=0`. The client gets only `PATH` and the `api` password in its environment, and the app container runs as a non-root user. The Docker build fails if the client lacks `--sandbox`.
 - **Passwords and client secrets** – hashed with scrypt + random salt (one-way, not encrypted), never returned by the API. Client secrets are shown only once, on creation.
 - **Access tokens** – JWT (HS256) valid for 15 minutes, not checked against the DB (fast); a deleted client keeps access until it expires. Clients simply request a new token.
-- **TOTP** – each code works only once (the last used 30 s time step is stored).
+- **TOTP** – each code works only once: the 30 s time step is claimed with a conditional `UPDATE`, so of concurrent logins with the same code exactly one succeeds.
 - **Account lockout** – 5 wrong passwords/TOTP codes lock the user for 15 minutes (HTTP 423); a password change unlocks. Not done by IP in Nginx, because all users come through the application's IP.
 - **Nginx** – TLS 1.2/1.3, port 80 redirects to 443, `/auth/token` limited to 5 requests/min per IP (burst 20, then HTTP 429).
 
@@ -204,7 +205,7 @@ POST /database/backup
   "database_name": "testdb"
 }
 ```
-Response: SQL dump string in `data` field.
+Response: SQL dump string in `data` field. It includes tables, data, triggers, stored procedures/functions (`--routines`) and events (`--events`); binary columns (BLOB, VARBINARY...) are dumped as hex literals (`--hex-blob`), so the dump is valid UTF-8 and restores byte for byte.
 
 **Restore:**
 ```
@@ -215,7 +216,7 @@ POST /database/restore
 }
 ```
 
-**Note:** The SQL dump must be valid MySQL SQL. The operation is executed directly on the database.
+**Note:** The SQL dump must be valid MySQL SQL. The operation is executed directly on the database as the `api` user. Client commands like `DELIMITER` work; commands touching the shell or files (`\!`, `source`...) are rejected with `400`.
 
 ## Linting & Tests
 

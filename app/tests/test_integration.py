@@ -10,6 +10,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import pyotp
 import pytest
@@ -124,6 +125,64 @@ def test_db_user_cannot_touch_system_or_auth_data(token):
         assert call("POST", "/database/restore",
                     {"database_name": "it_sec", "sql_dump": sql}, token)[0] == 400, sql
     call("DELETE", "/database/delete", {"database_name": "it_sec"}, token)
+
+
+def test_restore_blocks_client_shell_and_file_commands(token):
+    call("POST", "/database/create", {"database_name": "it_sbx"}, token)
+    try:
+        for sql in ("\\! printf 'SHELL_%s' RAN >&2\nSELECT * FROM nope;",
+                    "system printf 'SHELL_%s' RAN >&2\nSELECT * FROM nope;",
+                    "source /etc/passwd"):
+            status, body = call("POST", "/database/restore",
+                                {"database_name": "it_sbx", "sql_dump": sql}, token)
+            assert status == 400 and "SHELL_RAN" not in body["detail"], sql
+            assert "root:" not in body["detail"], sql
+    finally:
+        call("DELETE", "/database/delete", {"database_name": "it_sbx"}, token)
+
+
+def test_backup_binary_data_and_routines_into_empty_database(token):
+    for db in ("it_src", "it_dst"):
+        call("DELETE", "/database/delete", {"database_name": db}, token)
+        assert call("POST", "/database/create", {"database_name": db}, token)[0] == 200
+    try:
+        setup = ("CREATE TABLE blobs (id INT PRIMARY KEY, payload BLOB, vb VARBINARY(8));\n"
+                 "INSERT INTO blobs VALUES (1, X'FF0080', X'00FE');\n"
+                 "CREATE TABLE seen (h VARCHAR(64));\n"
+                 "DELIMITER //\n"
+                 "CREATE PROCEDURE mark() BEGIN\n"
+                 "  INSERT INTO seen SELECT CONCAT(HEX(payload), ':', HEX(vb)) FROM blobs;\n"
+                 "END//\nDELIMITER ;\n")
+        assert call("POST", "/database/restore",
+                    {"database_name": "it_src", "sql_dump": setup}, token)[0] == 200
+        status, body = call("POST", "/database/backup", {"database_name": "it_src"}, token)
+        assert status == 200
+        assert call("POST", "/database/restore",
+                    {"database_name": "it_dst", "sql_dump": body["data"]}, token)[0] == 200
+        assert call("POST", "/database/restore",
+                    {"database_name": "it_dst", "sql_dump": "CALL mark();"}, token)[0] == 200
+        assert call("GET", "/row/get/it_dst/seen", token=token)[1]["data"] == ["FF0080:00FE"]
+    finally:
+        for db in ("it_src", "it_dst"):
+            call("DELETE", "/database/delete", {"database_name": db}, token)
+
+
+def test_concurrent_logins_with_same_totp_code(token):
+    status, body = call("POST", "/user", {"username": "it_race", "email": "a@b.c",
+                                          "password": "pw"}, token)
+    user_id = body["data"]["id"]
+    try:
+        secret = pyotp.random_base32()
+        totp = pyotp.TOTP(secret)
+        assert call("POST", f"/user/{user_id}/totp/enable",
+                    {"secret": secret, "code": totp.now()}, token)[0] == 200
+        code = totp.at(time.time() + 30)  # next step, not used by enable
+        with ThreadPoolExecutor(4) as pool:
+            statuses = list(pool.map(lambda _: user_login(token, "it_race", "pw", code)[0],
+                                     range(4)))
+        assert sorted(statuses) == [200] + [401] * 3
+    finally:
+        call("DELETE", f"/user/{user_id}", token=token)
 
 
 def test_user_login_totp_and_lockout(token):

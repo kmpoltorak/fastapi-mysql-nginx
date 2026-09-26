@@ -108,3 +108,34 @@ def test_user_login_and_clients_require_client_token():
 def test_unknown_client_rejected():
     assert client.post("/auth/token", json={"client_id": "x", "client_secret": "y"}
                        ).status_code == 401
+
+
+def test_totp_login_rejected_when_step_already_claimed(monkeypatch):
+    secret = pyotp.random_base32()
+    user = (1, auth.hash_password("pw"), secret, None, 0)
+    calls = []
+
+    def fake(statement, database_name=None, params=None, auth=False):
+        calls.append(statement)
+        if statement.startswith("SELECT id, password_hash"):
+            return [user]
+        return 0  # conditional UPDATE changed no row: a concurrent login used the code
+    monkeypatch.setattr(app_module, "query", fake)
+    r = client.post("/user/login", headers=HEADERS, json={
+        "username": "u", "password": "pw", "totp": pyotp.TOTP(secret).now()})
+    assert r.status_code == 401
+    assert any("totp_last_step < %s" in s for s in calls)
+
+
+def test_mysql_tools_are_sandboxed(monkeypatch):
+    runs = []
+    monkeypatch.setenv("DB_PASSWORD", "pw")
+    monkeypatch.setattr(app_module.subprocess, "run", lambda cmd, **kw: runs.append(
+        (cmd, kw)) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""}))
+    client.post("/database/restore", headers=HEADERS,
+                json={"database_name": "db", "sql_dump": "SELECT 1;"})
+    client.post("/database/backup", headers=HEADERS, json={"database_name": "db"})
+    (restore, restore_kw), (backup, _) = runs
+    assert {"--sandbox", "--local-infile=0"} <= set(restore)
+    assert set(restore_kw["env"]) == {"PATH", "MYSQL_PWD"}  # no JWT_SECRET etc.
+    assert {"--hex-blob", "--routines", "--events"} <= set(backup)

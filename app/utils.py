@@ -26,6 +26,7 @@ def query(statement: str, database_name: str = None, params: tuple = None, auth:
 
     Returns:
         list: rows of the result; single-column rows are flattened to values
+        int: affected row count for statements without a result set (UPDATE, INSERT...)
     """
     cnx = get_pool(auth).get_connection()
     try:
@@ -33,6 +34,8 @@ def query(statement: str, database_name: str = None, params: tuple = None, auth:
             cnx.cmd_init_db(database_name)  # USE <db>
         cursor = cnx.cursor()
         cursor.execute(statement, params)
+        if not cursor.with_rows:
+            return cursor.rowcount
         result = cursor.fetchall()
     finally:
         cnx.close()  # returns the connection to the pool

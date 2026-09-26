@@ -492,6 +492,13 @@ def user_login(request: UserLoginRequest):
     if password_ok and totp_secret and not request.totp:
         raise HTTPException(status_code=401, detail="TOTP code required")
     step = auth.totp_step(totp_secret, request.totp, last_step) if totp_secret else None
+    # Claim the step atomically: of concurrent logins with the same code only one wins,
+    # and the stored step never moves backwards
+    if password_ok and step is not None and not query(
+            "UPDATE api_auth.users SET failed_logins=0, locked_until=NULL, totp_last_step=%s "
+            "WHERE id=%s AND (totp_last_step IS NULL OR totp_last_step < %s)",
+            params=(step, user_id, step), auth=True):
+        step = None  # already used by a concurrent login
     if not password_ok or (totp_secret and step is None):
         if rows:
             query("UPDATE api_auth.users SET failed_logins = failed_logins + 1, "
@@ -501,9 +508,9 @@ def user_login(request: UserLoginRequest):
                           user_id), auth=True)
         logging.warning("Failed login for user %r", request.username)
         raise HTTPException(status_code=401, detail="Bad credentials")
-    query("UPDATE api_auth.users SET failed_logins=0, locked_until=NULL, "
-          "totp_last_step=COALESCE(%s, totp_last_step) WHERE id=%s",
-          params=(step, user_id), auth=True)
+    if not totp_secret:
+        query("UPDATE api_auth.users SET failed_logins=0, locked_until=NULL WHERE id=%s",
+              params=(user_id,), auth=True)
     return APIResponse(code=200, message="Login successful", data=fetch_user(user_id))
 
 
@@ -630,17 +637,22 @@ def delete_user(user_id: int):
 
 
 def run_mysql_tool(tool: str, database_name: str, *args: str, stdin: str = None):
-    """Run mysql/mysqldump as the `api` user; password is passed via env."""
+    """Run mysql/mysqldump as the `api` user; password is passed via env.
+
+    The environment is minimal, so the tool never sees JWT_SECRET or AUTH_DB_PASSWORD.
+    """
     cmd = [
         tool,
         f"-h{os.getenv('MYSQL_HOST', 'db')}",
         "-uapi",
         "--ssl-verify-server-cert=OFF",
+        "--default-character-set=utf8mb4",
         *args,
         database_name
     ]
-    env = {**os.environ, "MYSQL_PWD": os.environ["DB_PASSWORD"]}
-    return subprocess.run(cmd, input=stdin, capture_output=True, text=True, env=env)
+    env = {"PATH": os.environ["PATH"], "MYSQL_PWD": os.environ["DB_PASSWORD"]}
+    # strict utf-8: a dump must never be silently altered (binary data is hex, see backup)
+    return subprocess.run(cmd, input=stdin, capture_output=True, encoding="utf-8", env=env)
 
 
 @app.post("/database/backup",
@@ -651,7 +663,9 @@ def run_mysql_tool(tool: str, database_name: str, *args: str, stdin: str = None)
 def backup_database(request: DatabaseBackupRequest):
     """Backup a database and return SQL dump as string."""
     # --no-tablespaces: tablespace info needs the global PROCESS privilege
-    result = run_mysql_tool("mysqldump", request.database_name, "--no-tablespaces")
+    # --hex-blob: binary columns as hex literals, so the dump is valid UTF-8 text
+    result = run_mysql_tool("mysqldump", request.database_name, "--no-tablespaces",
+                            "--hex-blob", "--routines", "--events")
     if result.returncode != 0:
         raise HTTPException(status_code=400, detail=f"mysqldump error: {result.stderr}")
     return APIResponse(code=200, message="Backup successful", data=result.stdout)
@@ -666,7 +680,10 @@ def restore_database(request: DatabaseRestoreRequest):
     """Restore a database from SQL dump string."""
     if not request.sql_dump.strip():
         raise HTTPException(status_code=400, detail="SQL dump is empty")
-    result = run_mysql_tool("mysql", request.database_name, stdin=request.sql_dump)
+    # --sandbox (MariaDB client): rejects client commands touching the shell or files
+    # (\! system, source, tee, pager...); --local-infile=0 blocks LOAD DATA LOCAL
+    result = run_mysql_tool("mysql", request.database_name, "--sandbox", "--local-infile=0",
+                            stdin=request.sql_dump)
     if result.returncode != 0:
         raise HTTPException(status_code=400, detail=f"mysql error: {result.stderr}")
     return APIResponse(code=200, message="Restore successful")
